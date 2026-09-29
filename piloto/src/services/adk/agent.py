@@ -1,13 +1,19 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
 
-from src.services.adk.infos import CHAVES_METADATA, GOOGLE_ADK_MODEL
+from src.services.adk.infos import AGENT_TIMEZONE, CHAVES_METADATA, GOOGLE_ADK_MODEL
 from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
-    atualizar_cargo_cliente,
     atualizar_empresa_cliente,
     atualizar_nome_cliente,
-    atualizar_quantidade_funcionarios_cliente,
+    atualizar_uso_sistema_whatsapp,
+    atualizar_volumetria_atendimento,
+    consultar_eventos_calendario,
+    criar_card_kanban,
+    criar_evento_calendario,
     encerrar_conversa,
     parar_envio_campanhas,
     registrar_disponibilidade_contato,
@@ -15,12 +21,13 @@ from src.services.adk.tools import (
 )
 
 BASE_INSTRUCTION = """
-Você é {nome}, recepcionista virtual da Fluxy Agentes, atendendo via WhatsApp.
+Você é {nome}, atendendo via WhatsApp.
 Responda de forma natural, clara e objetiva, sempre em português. Faça uma
 pergunta por vez quando precisar de mais informação do contato — nunca
 acumule várias perguntas na mesma mensagem. Nunca invente informações que
 você não tenha certeza.
 
+{data_atual_block} # Data/hora atual — base pra converter "amanhã às 14h" em data
 {fluxo_block} # Fluxo de instrução do primeiro contato ou apos o primeiro contato
 {coleta_dados_block} # Roteiro obrigatório de coleta de dados do contato
 {dados_conhecidos_block} # Dados salvos no contato no campo do metadado
@@ -29,18 +36,25 @@ você não tenha certeza.
 
 ## Ferramentas disponíveis
 
-- atualizar_nome_cliente / atualizar_empresa_cliente / atualizar_cargo_cliente
-  / atualizar_quantidade_funcionarios_cliente: chame cada uma assim que o
-  contato informar ou confirmar o dado correspondente (não precisa
-  perguntar de novo o que já estiver na seção "Dados já registrados" acima).
-- registrar_disponibilidade_contato: chame se o contato informar o melhor
-  dia e horário para conversarem, caso isso seja pedido a ele.
-- solicitar_atendimento_humano: chame assim que os 4 dados obrigatórios
-  estiverem confirmados, para encaminhar o atendimento. Se você já souber a
-  fila certa, preencha o parâmetro fila_sugerida com o nome dela. Também
-  chame sempre que o contato pedir explicitamente para falar com uma
-  pessoa, ou quando a dúvida estiver fora do que você consegue resolver com
-  segurança.
+- atualizar_nome_cliente / atualizar_empresa_cliente /
+  atualizar_volumetria_atendimento / atualizar_uso_sistema_whatsapp: chame
+  cada uma assim que o contato informar ou confirmar o dado correspondente
+  (não precisa perguntar de novo o que já estiver na seção "Dados já
+  registrados" acima).
+- registrar_disponibilidade_contato: chame quando o contato informar a data
+  e o horário em que pode conversar — ela já cria (ou remarca) o evento no
+  calendário. Não chame criar_evento_calendario de novo para o mesmo horário.
+- criar_card_kanban: cria/atualiza o card do contato no Kanban, com uma
+  descrição do lead escrita por você.
+- criar_evento_calendario: cria um evento no calendário para este contato
+  (para outros compromissos além do horário de conversa acima).
+- consultar_eventos_calendario: mostra os eventos já marcados com este
+  contato e os horários ocupados da agenda — use antes de propor/confirmar
+  um horário ou quando o contato perguntar o que já está marcado.
+- solicitar_atendimento_humano: chame sempre que o contato pedir
+  explicitamente para falar com uma pessoa, ou quando a dúvida estiver fora
+  do que você consegue resolver com segurança. Se você já souber a fila
+  certa, preencha o parâmetro fila_sugerida com o nome dela.
 - encerrar_conversa: chame quando o contato se despedir, confirmar que não
   precisa de mais nada, ou logo depois de encaminhar o atendimento humano.
 - parar_envio_campanhas: chame assim que o contato pedir explicitamente para
@@ -62,9 +76,8 @@ PRIMEIRO_CONTATO_INSTRUCTION = """
 ## Primeiro contato
 
 Este é o PRIMEIRO contato com esta pessoa — não há histórico de conversa
-anterior. Apresente-se de forma breve e cordial como a recepcionista virtual
-da empresa, explique que precisa confirmar alguns dados rápidos antes de
-encaminhar o atendimento, e comece a coleta de dados descrita abaixo.
+anterior. Apresente-se de forma breve e cordial, explique que precisa
+confirmar alguns dados rápidos, e comece a coleta de dados descrita abaixo.
 """
 
 # Conversa normal — quando o contato já tem histórico (ver _tem_historico).
@@ -82,23 +95,28 @@ descrita abaixo, pulando o que já estiver em "Dados já registrados".
 COLETA_DADOS_INSTRUCTION = """
 ## Coleta de dados obrigatória
 
-Antes de encaminhar o atendimento, confirme estes 4 dados sobre o contato,
-um de cada vez (pule qualquer um que já esteja em "Dados já registrados"
-acima):
+Confirme estes dados sobre o contato, um de cada vez (pule qualquer um que
+já esteja em "Dados já registrados" acima):
 
-1. Nome da pessoa
-2. Nome da empresa em que trabalha
-3. Cargo/função que ocupa na empresa
-4. Quantidade de funcionários da empresa
+1. Nome da pessoa -> atualizar_nome_cliente
+2. Nome da empresa -> atualizar_empresa_cliente
+3. Volumetria de atendimento da empresa, de 1 a 10 (1 = baixa, 10 = muito
+   alta) -> atualizar_volumetria_atendimento
+4. Se já usou algum sistema de gerenciamento de WhatsApp para empresas
+   -> atualizar_uso_sistema_whatsapp
+5. Uma data e um horário em que pode conversar
+   -> registrar_disponibilidade_contato (já cria o evento no calendário)
 
 Assim que o contato informar cada dado, chame a ferramenta correspondente
-imediatamente (atualizar_nome_cliente, atualizar_empresa_cliente,
-atualizar_cargo_cliente, atualizar_quantidade_funcionarios_cliente).
+imediatamente.
 
-Assim que TODOS os 4 dados estiverem confirmados (já registrados ou
-coletados nesta conversa), chame solicitar_atendimento_humano para
-encaminhar o atendimento e, em seguida, encerrar_conversa. Não continue
-fazendo perguntas depois disso.
+Card no Kanban: assim que o contato responder o nome da empresa, chame
+criar_card_kanban com a descrição do lead. A cada dado novo coletado depois
+disso, chame criar_card_kanban de novo para atualizar a descrição.
+
+Quando todos os dados estiverem registrados (e o evento criado), confirme
+com o contato a data e o horário combinados e chame encerrar_conversa. Não
+continue fazendo perguntas depois disso.
 """
 
 
@@ -124,9 +142,22 @@ def _tem_historico(target_info: dict) -> bool: # Checar o metadado para ver se a
 LABELS_METADATA = {
     "nome": "Nome",
     "nome_empresa": "Empresa",
-    "cargo": "Cargo",
-    "quantidade_de_funcionarios": "Quantidade de funcionários",
+    "volumetria_atendimento": "Volumetria de atendimento (1-10)",
+    "ja_usou_sistema_whatsapp": "Já usou sistema de gerenciamento de WhatsApp",
+    "data_horario_contato": "Data/horário combinado para conversar",
 }
+
+DIAS_SEMANA = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
+
+
+def _build_data_atual_block() -> str:
+    """Sem isso o modelo não tem como transformar "amanhã às 14h" ou "sexta"
+    numa data de verdade pro calendário."""
+    agora = datetime.now(ZoneInfo(AGENT_TIMEZONE))
+    return (
+        f"Data e hora atual: {DIAS_SEMANA[agora.weekday()]}, "
+        f"{agora.strftime('%d/%m/%Y %H:%M')} (fuso {AGENT_TIMEZONE})."
+    )
 
 
 def _build_known_data_block(target_info: dict) -> str: # Função de coletar os metadados e passar para o agente
@@ -181,8 +212,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     ragEnabled) e target_info (nome/histórico já conhecidos), que vêm
     frescos no payload de cada mensagem da fila."""
     target_info = target_info or {}
-    # nome = agent_info.get("name") or "piloto"
-    nome = "Fly" # Esta manual para testes
+    nome = agent_info.get("name") or "o assistente virtual"
     personality = (agent_info.get("personality") or "").strip()
     rag_enabled = bool(agent_info.get("ragEnabled"))
 
@@ -197,6 +227,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
 
     instruction = BASE_INSTRUCTION.format(
         nome=nome,
+        data_atual_block=_build_data_atual_block(),
         fluxo_block=fluxo_block,
         coleta_dados_block=COLETA_DADOS_INSTRUCTION,
         dados_conhecidos_block=dados_conhecidos_block,
@@ -207,9 +238,12 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     tools = [
         atualizar_nome_cliente,
         atualizar_empresa_cliente,
-        atualizar_cargo_cliente,
-        atualizar_quantidade_funcionarios_cliente,
+        atualizar_volumetria_atendimento,
+        atualizar_uso_sistema_whatsapp,
         registrar_disponibilidade_contato,
+        criar_card_kanban,
+        criar_evento_calendario,
+        consultar_eventos_calendario,
         solicitar_atendimento_humano,
         encerrar_conversa,
         parar_envio_campanhas,
@@ -224,7 +258,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         # exibição só entra na instrução (`nome` acima).
         name="recepcionista_agent",
         model=GOOGLE_ADK_MODEL,
-        description=f"Fly recepcionista virtual via WhatsApp.",
+        description="Agente de atendimento via WhatsApp.",
         instruction=instruction,
         tools=tools,
     )

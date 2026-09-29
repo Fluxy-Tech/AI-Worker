@@ -1,10 +1,26 @@
 import os
 
-# Metadados que a IA pode armazenar
-CHAVES_METADATA = ("nome", "nome_empresa", "quantidade_de_funcionarios", "cargo")
+# Metadados que a IA pode armazenar (sincronizados em Target.metadata ao fim
+# de cada turno — ver runner.py). Roteiro de prospecção de leads:
+#   nome                      -> nome da pessoa
+#   nome_empresa              -> nome da empresa
+#   volumetria_atendimento    -> 1 (baixa) a 10 (muito alta)
+#   ja_usou_sistema_whatsapp  -> "Sim"/"Não" (+ qual sistema, se informar)
+#   data_horario_contato      -> data/hora que o lead pode conversar (dd/mm/aaaa hh:mm)
+CHAVES_METADATA = (
+    "nome",
+    "nome_empresa",
+    "volumetria_atendimento",
+    "ja_usou_sistema_whatsapp",
+    "data_horario_contato",
+)
 
 # Nome do agente
 APP_NAME = os.getenv("GOOGLE_ADK_APP_NAME", "piloto")
+
+# Fuso usado pra interpretar datas/horários que o contato fala ("amanhã às
+# 14h") e pra mostrar a data atual pro modelo — o calendário grava em UTC.
+AGENT_TIMEZONE = os.getenv("AGENT_TIMEZONE", "America/Sao_Paulo")
 
 # Modelo Gemini usado pelo agente ADK — GOOGLE_ADK_MODEL sobrescreve o default
 # fixado aqui. Se a env estiver setada em produção com um modelo descontinuado

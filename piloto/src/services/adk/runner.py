@@ -6,8 +6,14 @@ from google.adk.runners import Runner
 from google.genai import types
 from src.services.adk.infos import CHAVES_METADATA, APP_NAME, GOOGLE_ADK_MODEL
 from src.infra.adk.session_service import get_session_service
-from src.infra.agent_api.client import bloquear_campanhas_contato, resetar_metadados_contato, sincronizar_metadados_contato
+from src.infra.agent_api.client import (
+    bloquear_campanhas_contato,
+    criar_card_crm,
+    resetar_metadados_contato,
+    sincronizar_metadados_contato,
+)
 from src.services.adk.agent import build_agent
+from src.services.adk.tools import STATE_CARD_CRM_ID, descricao_lead
 
 
 class ResultadoResposta:
@@ -111,6 +117,19 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             metadata = {chave: sessao_final.state[chave] for chave in CHAVES_METADATA if chave in sessao_final.state}
             metadata["contato_iniciado"] = True
             sincronizar_metadados_contato(user_id, metadata)
+
+            # Regra do piloto: todo contato que respondeu pelo menos o nome
+            # da empresa ganha card no Kanban. O modelo deveria ter chamado
+            # criar_card_kanban (com a descrição no tom da personalidade) —
+            # se esqueceu, cria aqui com o resumo determinístico dos dados.
+            # Idempotente no Agent-Api, então repetir num turno seguinte não
+            # duplica o card.
+            if sessao_final.state.get("nome_empresa") and not sessao_final.state.get(STATE_CARD_CRM_ID):
+                try:
+                    criar_card_crm(user_id, descricao_lead(sessao_final.state))
+                    print(f"[session={session_id} user={user_id}] card CRM criado pelo fallback do runner")
+                except Exception as e:
+                    print(f"[session={session_id} user={user_id}] falha no fallback de card CRM: {e}")
 
         # Sem isso, handoff_requested/closing_requested ficam GRUDADOS pra
         # sempre no state da sessão do ADK (nada os limpa depois de usados) —

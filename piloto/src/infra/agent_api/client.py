@@ -224,3 +224,95 @@ def update_rag_document_status(
         )
     except Exception as e:
         print(f"[julia] Falha ao atualizar status do RagDocument {rag_document_id}: {e}")
+
+
+# ---------- FUNÇÕES PADRÃO DE AGENTE: KANBAN (CRM) E CALENDÁRIO ----------
+# Diferente das chamadas best-effort acima, estas LEVANTAM exceção em falha —
+# quem chama (tools do ADK / runner) decide o que fazer com o erro e pode
+# devolver o motivo pro modelo.
+
+
+def _raise_for_api_error(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    try:
+        message = response.json().get("message")
+    except Exception:
+        message = None
+    raise RuntimeError(message or f"Agent-Api respondeu {response.status_code}")
+
+
+def criar_card_crm(target_id: str, descricao: str | None = None) -> dict:
+    """Cria o card do contato no Kanban da empresa (estágio "Início") ou, se
+    ele já tiver card, só atualiza a descrição. Idempotente. Retorna
+    {"card": {...}, "created": bool}."""
+    body = {"description": descricao} if descricao else {}
+    response = httpx.post(
+        f"{BASE_URL}/internal/targets/{target_id}/crm-card",
+        json=body,
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_api_error(response)
+    return response.json().get("result") or {}
+
+
+def criar_evento_calendario(target_id: str, nome: str, data_evento_iso: str, descricao: str | None = None) -> dict:
+    """Cria um evento no calendário da empresa ligado ao contato.
+    data_evento_iso precisa ter fuso (ex: 2026-09-30T14:00:00-03:00)."""
+    body: dict = {"name": nome, "dateEvent": data_evento_iso}
+    if descricao:
+        body["description"] = descricao
+    response = httpx.post(
+        f"{BASE_URL}/internal/targets/{target_id}/calendar-events",
+        json=body,
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_api_error(response)
+    return response.json().get("result") or {}
+
+
+def atualizar_evento_calendario(
+    target_id: str,
+    event_id: str,
+    nome: str | None = None,
+    data_evento_iso: str | None = None,
+    descricao: str | None = None,
+) -> dict:
+    """Remarca/edita um evento do próprio contato (só se não estiver encerrado)."""
+    body: dict = {}
+    if nome:
+        body["name"] = nome
+    if data_evento_iso:
+        body["dateEvent"] = data_evento_iso
+    if descricao:
+        body["description"] = descricao
+    response = httpx.patch(
+        f"{BASE_URL}/internal/targets/{target_id}/calendar-events/{event_id}",
+        json=body,
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_api_error(response)
+    return response.json().get("result") or {}
+
+
+def consultar_eventos_calendario(target_id: str, de_iso: str | None = None, ate_iso: str | None = None) -> dict:
+    """Eventos do contato + horários já ocupados da empresa no período (padrão
+    da API: agora → +30 dias; máx. 62 dias). Retorna
+    {"contactEvents": [...], "busySlots": [...]} — eventos de outros contatos
+    vêm só com data/status."""
+    params: dict = {}
+    if de_iso:
+        params["from"] = de_iso
+    if ate_iso:
+        params["to"] = ate_iso
+    response = httpx.get(
+        f"{BASE_URL}/internal/targets/{target_id}/calendar-events",
+        params=params,
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_api_error(response)
+    return response.json().get("result") or {"contactEvents": [], "busySlots": []}

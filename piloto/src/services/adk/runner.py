@@ -16,6 +16,7 @@ from src.infra.adk.session_service import get_session_service
 from src.infra.agent_api.client import (
     bloquear_campanhas_contato,
     comentar_card_crm,
+    gerar_resumo_conversa,
     resetar_metadados_contato,
     sincronizar_metadados_contato,
 )
@@ -46,19 +47,42 @@ def _formatar_dados(dados: dict, campos: list[dict]) -> str:
     return "\n".join(f"- {labels.get(k, k)}: {dados[k]}" for k in chaves if dados.get(k))
 
 
+def _transcricao(eventos: list) -> str:
+    """Só as falas em texto (contato e agente) — chamadas/respostas de tool
+    ficam de fora."""
+    linhas = []
+    for event in eventos or []:
+        if not (event.content and event.content.parts):
+            continue
+        texto = " ".join(p.text for p in event.content.parts if getattr(p, "text", None)).strip()
+        if texto:
+            linhas.append(f"{'Contato' if event.author == 'user' else 'Agente'}: {texto}")
+    return "\n".join(linhas)
+
+
+def _montar_comentario_card(titulo: str, dados: str, resumo: str | None) -> str:
+    partes = [titulo]
+    if dados:
+        partes.append(f"Dados coletados:\n{dados}")
+    if resumo:
+        partes.append(f"Resumo da conversa:\n{resumo}")
+    return "\n\n".join(partes)
+
+
 def _executar_funcao_card(
     user_id: str,
     session_id: str,
     agent_config: dict,
     target_info: dict,
-    pergunta: str,
     inicio_conversa: bool,
     estado_antes: dict,
     estado_depois: dict,
+    eventos: list,
 ) -> None:
     """Função KANBAN_CARD (card "Funções" do Console): cria o card do contato
-    e comenta nele os dados da conversa — determinística, roda aqui no runner
-    e não depende do modelo chamar uma tool.
+    (prioridade Alta) e comenta nele os dados coletados e um resumo da
+    conversa — determinística, roda aqui no runner e não depende do modelo
+    chamar uma tool.
     - Início da conversa: primeiro turno de uma sessão ADK nova.
     - Após a coleta: no turno em que a coleta (fixa + metadados ativos)
       passou de incompleta pra completa."""
@@ -70,22 +94,22 @@ def _executar_funcao_card(
     dados_antes = _dados_do_contato(target_info, estado_antes)
     dados_depois = _dados_do_contato(target_info, estado_depois)
 
-    comentarios = []
+    titulos = []
     if card["inicio"] and inicio_conversa:
-        texto = f"Nova conversa iniciada pelo contato.\n\nMensagem do contato:\n{pergunta}"
-        conhecidos = _formatar_dados(dados_depois, campos)
-        if conhecidos:
-            texto += f"\n\nDados já conhecidos:\n{conhecidos}"
-        comentarios.append(texto)
+        titulos.append("Nova conversa iniciada pelo contato.")
     if card["apos_coleta"] and _coleta_completa(dados_depois, campos) and not _coleta_completa(dados_antes, campos):
-        comentarios.append(
-            f"Coleta de dados concluída.\n\nDados coletados:\n{_formatar_dados(dados_depois, campos)}"
-            f"\n\nÚltima mensagem do contato:\n{pergunta}"
-        )
+        titulos.append("Coleta de dados concluída.")
+    if not titulos:
+        return
 
-    for comentario in comentarios:
+    # Um resumo só por turno, mesmo que os dois momentos caiam juntos.
+    resumo = gerar_resumo_conversa(_transcricao(eventos), agent_config.get("openaiToken"))
+    dados = _formatar_dados(dados_depois, campos)
+
+    for titulo in titulos:
+        comentario = _montar_comentario_card(titulo, dados, resumo)
         try:
-            comentar_card_crm(user_id, comentario)
+            comentar_card_crm(user_id, comentario, prioridade="HIGH", estagio_id=card["estagio"])
             print(f"[session={session_id} user={user_id}] funcao card: comentario registrado no card")
         except Exception as e:
             print(f"[session={session_id} user={user_id}] funcao card: falha ao comentar no card: {e}")
@@ -208,10 +232,10 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
                 session_id,
                 agent_config,
                 target_info,
-                pergunta,
                 inicio_conversa,
                 estado_antes,
                 dict(sessao_final.state),
+                sessao_final.events,
             )
 
         # Sem isso, handoff_requested/closing_requested ficam GRUDADOS pra

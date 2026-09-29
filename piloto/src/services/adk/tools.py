@@ -233,3 +233,20 @@ def consultar_eventos_calendario(
         ],
         "horarios_ocupados": [_local(e["dateEvent"]) for e in resultado.get("busySlots", [])],
     }
+
+
+def consultar_estagios_kanban(tool_context: ToolContext) -> dict:
+    """Lista os estágios (esteiras) do Kanban da empresa, na ordem em que
+    aparecem na tela. O estágio padrão é onde os leads novos entram."""
+    try:
+        estagios = agent_api.listar_estagios_kanban(tool_context.user_id)
+    except Exception as e:
+        print(f"[julia] Falha ao listar estágios do Kanban do contato {tool_context.user_id}: {e}")
+        return {"ok": False, "erro": "Não foi possível consultar o Kanban agora."}
+    return {
+        "ok": True,
+        "estagios": [
+            {"nome": e.get("nameStage"), "posicao": e.get("position"), "padrao": bool(e.get("isDefault"))}
+            for e in estagios
+        ],
+    }

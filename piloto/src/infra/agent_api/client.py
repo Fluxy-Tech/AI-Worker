@@ -134,6 +134,35 @@ def generate_free_error_message(agent_name: str, openai_api_key: str | None = No
         return "Desculpe, tivemos um problema para responder agora. Tente novamente em instantes."
 
 
+def gerar_resumo_conversa(transcricao: str, openai_api_key: str | None = None) -> str | None:
+    """Resumo curto de como foi a conversa, pro comentário do card no Kanban
+    (função KANBAN_CARD). None se falhar — o comentário sai só com os dados."""
+    try:
+        response = _get_openai_client(openai_api_key).chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Você resume conversas de WhatsApp entre um agente de IA e um lead "
+                        "para a equipe comercial. Escreva em português, em 2 a 5 frases, "
+                        "como foi a conversa: o que o contato buscava, o interesse "
+                        "demonstrado, dúvidas ou objeções e o que ficou combinado. Não "
+                        "repita dados cadastrais (nome, empresa etc.) nem cite mensagens "
+                        "literalmente."
+                    ),
+                },
+                {"role": "user", "content": transcricao},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip() or None
+    except Exception as e:
+        print(f"[julia] Falha ao gerar resumo da conversa pro card: {e}")
+        return None
+
+
 def sincronizar_metadados_contato(target_id: str, metadata: dict) -> None:
     """Envia o snapshot acumulado do que o agente aprendeu do contato nesta
     conversa (nome, cidade etc.) pro Agent-Api, pra persistir entre sessões e
@@ -274,17 +303,41 @@ def agendar_evento_calendario(
     return response.json().get("result") or {}
 
 
-def comentar_card_crm(target_id: str, comentario: str) -> dict:
+def comentar_card_crm(
+    target_id: str,
+    comentario: str,
+    prioridade: str | None = None,
+    estagio_id: str | None = None,
+) -> dict:
     """Função KANBAN_CARD: comenta no card do contato como "Agente de IA"
-    (cria o card se ainda não existir)."""
+    (cria o card se ainda não existir). prioridade (LOW/MEDIUM/HIGH/URGENT) e
+    estagio_id (estágio escolhido no Console; None = "Início") só valem
+    quando o card é criado nesta chamada."""
+    body = {"comment": comentario}
+    if prioridade:
+        body["priority"] = prioridade
+    if estagio_id:
+        body["stageId"] = estagio_id
     response = httpx.post(
         f"{BASE_URL}/internal/targets/{target_id}/crm-card/comments",
-        json={"comment": comentario},
+        json=body,
         headers={"x-internal-api-key": INTERNAL_API_KEY},
         timeout=10,
     )
     _raise_for_api_error(response)
     return response.json().get("result") or {}
+
+
+def listar_estagios_kanban(target_id: str) -> list[dict]:
+    """Estágios (esteiras) do Kanban da empresa do contato, na ordem da tela:
+    [{"id", "nameStage", "position", "isDefault"}, ...]."""
+    response = httpx.get(
+        f"{BASE_URL}/internal/targets/{target_id}/crm-stages",
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_api_error(response)
+    return response.json().get("result") or []
 
 
 def consultar_eventos_calendario(target_id: str, de_iso: str | None = None, ate_iso: str | None = None) -> dict:

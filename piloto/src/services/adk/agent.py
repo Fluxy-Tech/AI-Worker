@@ -153,6 +153,19 @@ ENCERRAMENTO_COM_AGENDAMENTO = """Quando todos os dados estiverem registrados e 
 "Funções" abaixo), confirme com o contato a data e o horário combinados e
 chame encerrar_conversa. Não continue fazendo perguntas depois disso."""
 
+# Switch "Enviar para o atendimento humano ao terminar" do card "Funções"
+# (payload agent.handoffAfterFunctions) — troca o encerrar_conversa do fim
+# do roteiro pelo encaminhamento a um atendente.
+ENCERRAMENTO_HANDOFF_SEM_AGENDAMENTO = """Quando todos os dados estiverem registrados, chame
+solicitar_atendimento_humano com o motivo "Coleta de dados concluída" para
+encaminhar o contato a um atendente. Não chame encerrar_conversa e não
+continue fazendo perguntas depois disso."""
+
+ENCERRAMENTO_HANDOFF_COM_AGENDAMENTO = """Quando todos os dados estiverem registrados e o evento estiver agendado (ver
+"Funções" abaixo), chame solicitar_atendimento_humano com o motivo "Coleta
+de dados e agendamento concluídos" para encaminhar o contato a um atendente.
+Não chame encerrar_conversa e não continue fazendo perguntas depois disso."""
+
 # Função CALENDAR_EVENT ligada no Console. O momento vem dos switches
 # runAtStart / runAfterMetadata (os dois podem estar ligados).
 FUNCAO_EVENTO_INSTRUCTION = """
@@ -236,14 +249,15 @@ def _build_data_atual_block() -> str:
 
 def funcoes_ativas(agent_info: dict) -> dict[str, dict]:
     """Funções fixas ligadas no Console (payload agent.functions), por tipo:
-    {"CALENDAR_EVENT": {"inicio": bool, "apos_coleta": bool}, ...}. Só entram
+    {"CALENDAR_EVENT": {"inicio": bool, "apos_coleta": bool, "estagio": None}, ...}.
+    estagio = crmStageId (só KANBAN_CARD; None = estágio padrão). Só entram
     as que têm pelo menos um momento ligado."""
     ativas = {}
     for funcao in agent_info.get("functions") or []:
         inicio = bool(funcao.get("runAtStart"))
         apos_coleta = bool(funcao.get("runAfterMetadata"))
         if funcao.get("type") and (inicio or apos_coleta):
-            ativas[funcao["type"]] = {"inicio": inicio, "apos_coleta": apos_coleta}
+            ativas[funcao["type"]] = {"inicio": inicio, "apos_coleta": apos_coleta, "estagio": funcao.get("crmStageId")}
     return ativas
 
 
@@ -379,9 +393,13 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     rag_block = RAG_INSTRUCTION if rag_enabled else ""
     funcoes = funcoes_ativas(agent_info)
     evento = funcoes.get(FUNCAO_EVENTO)
+    if agent_info.get("handoffAfterFunctions"):
+        encerramento = ENCERRAMENTO_HANDOFF_COM_AGENDAMENTO if evento else ENCERRAMENTO_HANDOFF_SEM_AGENDAMENTO
+    else:
+        encerramento = ENCERRAMENTO_COM_AGENDAMENTO if evento else ENCERRAMENTO_SEM_AGENDAMENTO
     coleta_dados_block = COLETA_DADOS_INSTRUCTION.format(
         metadados_adicionais_block=_build_metadados_adicionais_block(campos),
-        encerramento=ENCERRAMENTO_COM_AGENDAMENTO if evento else ENCERRAMENTO_SEM_AGENDAMENTO,
+        encerramento=encerramento,
     )
 
     instruction = BASE_INSTRUCTION.format(

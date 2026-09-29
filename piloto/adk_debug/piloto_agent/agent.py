@@ -30,6 +30,8 @@ _agent_config = {
     "functions": [
         {"type": "CALENDAR_EVENT", "runAtStart": False, "runAfterMetadata": True},
     ],
+    # True = encaminha pro atendimento humano ao terminar; False = encerra.
+    "handoffAfterFunctions": False,
 }
 
 # Troque metadata/name pra simular um contato que já tem histórico e/ou dados

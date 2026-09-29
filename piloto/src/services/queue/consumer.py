@@ -25,6 +25,7 @@ agrupado/debounced por sessão em janelas de 10s):
     "personality", "ragEnabled",    # só usados aqui (worker genérico)
     "metadataFields": [{"name", "nameToAgent", "rule"}],  # só os ativos — coletados via registrar_metadado
     "functions": [{"type", "runAtStart", "runAfterMetadata"}],  # CALENDAR_EVENT / KANBAN_CARD
+    "handoffAfterFunctions",        # fim do roteiro: true = atendimento humano, false = encerrar
   },
   "messagingSession": {"id", "startedAt"},
   "messages": [{"mongoMessageId", "externalMessageId", "type", "text", "timestamp"}, ...]

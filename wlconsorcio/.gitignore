@@ -1,9 +1,0 @@
-# Python
-.venv/
-venv/
-__pycache__/
-*.pyc
-**/.env
-.env
-.env-producao
-**/.env-producao

@@ -15,6 +15,21 @@ CHAVES_METADATA = (
     "data_horario_contato",
 )
 
+# Roteiro fixo de coleta — define quando "todos os metadados foram
+# coletados" (junto com os metadados ativos do Agent Console).
+# data_horario_contato fica de fora: é preenchido pela função de agendamento.
+CHAVES_COLETA_FIXA = (
+    "nome",
+    "nome_empresa",
+    "volumetria_atendimento",
+    "ja_usou_sistema_whatsapp",
+)
+
+# Funções fixas ligadas no card "Funções" do Agent Console (payload
+# agent.functions: [{type, runAtStart, runAfterMetadata}]).
+FUNCAO_EVENTO = "CALENDAR_EVENT"
+FUNCAO_CARD = "KANBAN_CARD"
+
 # Chave do state da sessão onde a tool registrar_metadado guarda os metadados
 # configurados no Agent Console ({nameToAgent: valor}) — o runner mescla em
 # Target.metadata junto com CHAVES_METADATA.

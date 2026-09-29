@@ -242,55 +242,44 @@ def _raise_for_api_error(response: httpx.Response) -> None:
     raise RuntimeError(message or f"Agent-Api respondeu {response.status_code}")
 
 
-def criar_card_crm(target_id: str, descricao: str | None = None) -> dict:
-    """Cria o card do contato no Kanban da empresa (estágio "Início") ou, se
-    ele já tiver card, só atualiza a descrição. Idempotente. Retorna
-    {"card": {...}, "created": bool}."""
-    body = {"description": descricao} if descricao else {}
-    response = httpx.post(
-        f"{BASE_URL}/internal/targets/{target_id}/crm-card",
-        json=body,
-        headers={"x-internal-api-key": INTERNAL_API_KEY},
-        timeout=10,
-    )
-    _raise_for_api_error(response)
-    return response.json().get("result") or {}
+class HorarioIndisponivelError(RuntimeError):
+    """409 do agendamento — a mensagem diz o motivo (ninguém livre / outro
+    evento no horário), pra o agente pedir outro horário ao contato."""
 
 
-def criar_evento_calendario(target_id: str, nome: str, data_evento_iso: str, descricao: str | None = None) -> dict:
-    """Cria um evento no calendário da empresa ligado ao contato.
-    data_evento_iso precisa ter fuso (ex: 2026-09-30T14:00:00-03:00)."""
+def agendar_evento_calendario(
+    target_id: str,
+    nome: str,
+    data_evento_iso: str,
+    descricao: str | None = None,
+    evento_id: str | None = None,
+) -> dict:
+    """Função CALENDAR_EVENT: agenda (ou remarca evento_id) num horário livre,
+    com um responsável entre os usuários liberados no Kanban. Retorna
+    {"event": {..., "user": {"id", "name"} | None}, "rescheduled": bool}."""
     body: dict = {"name": nome, "dateEvent": data_evento_iso}
     if descricao:
         body["description"] = descricao
+    if evento_id:
+        body["eventId"] = evento_id
     response = httpx.post(
-        f"{BASE_URL}/internal/targets/{target_id}/calendar-events",
+        f"{BASE_URL}/internal/targets/{target_id}/calendar-events/schedule",
         json=body,
         headers={"x-internal-api-key": INTERNAL_API_KEY},
         timeout=10,
     )
+    if response.status_code == 409:
+        raise HorarioIndisponivelError(response.json().get("message") or "Horário indisponível.")
     _raise_for_api_error(response)
     return response.json().get("result") or {}
 
 
-def atualizar_evento_calendario(
-    target_id: str,
-    event_id: str,
-    nome: str | None = None,
-    data_evento_iso: str | None = None,
-    descricao: str | None = None,
-) -> dict:
-    """Remarca/edita um evento do próprio contato (só se não estiver encerrado)."""
-    body: dict = {}
-    if nome:
-        body["name"] = nome
-    if data_evento_iso:
-        body["dateEvent"] = data_evento_iso
-    if descricao:
-        body["description"] = descricao
-    response = httpx.patch(
-        f"{BASE_URL}/internal/targets/{target_id}/calendar-events/{event_id}",
-        json=body,
+def comentar_card_crm(target_id: str, comentario: str) -> dict:
+    """Função KANBAN_CARD: comenta no card do contato como "Agente de IA"
+    (cria o card se ainda não existir)."""
+    response = httpx.post(
+        f"{BASE_URL}/internal/targets/{target_id}/crm-card/comments",
+        json={"comment": comentario},
         headers={"x-internal-api-key": INTERNAL_API_KEY},
         timeout=10,
     )

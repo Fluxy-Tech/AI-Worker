@@ -4,19 +4,23 @@ from zoneinfo import ZoneInfo
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
 
-from src.services.adk.infos import AGENT_TIMEZONE, CHAVES_METADATA, GOOGLE_ADK_MODEL, STATE_METADADOS_ADICIONAIS
+from src.services.adk.infos import (
+    AGENT_TIMEZONE,
+    CHAVES_METADATA,
+    FUNCAO_EVENTO,
+    GOOGLE_ADK_MODEL,
+    STATE_METADADOS_ADICIONAIS,
+)
 from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
     atualizar_empresa_cliente,
     atualizar_nome_cliente,
     atualizar_uso_sistema_whatsapp,
     atualizar_volumetria_atendimento,
+    agendar_evento,
     consultar_eventos_calendario,
-    criar_card_kanban,
-    criar_evento_calendario,
     encerrar_conversa,
     parar_envio_campanhas,
-    registrar_disponibilidade_contato,
     solicitar_atendimento_humano,
 )
 
@@ -28,6 +32,8 @@ from src.services.adk.tools import (
 #   do fluxo/coleta, que se referem a ele como "acima")
 # - fluxo_block: primeiro contato ou conversa com histórico (ver _tem_historico)
 # - coleta_dados_block: roteiro fixo de coleta de dados do contato
+# - funcoes_block: funções fixas ligadas no card "Funções" do Console (hoje
+#   só o agendamento tem instrução — o card do Kanban roda no runner)
 # - rag_block: uso da base de conhecimento (só com ragEnabled)
 BASE_INSTRUCTION = """
 Você é {nome}, atendendo via WhatsApp.
@@ -48,6 +54,8 @@ conhecimento.
 
 {coleta_dados_block}
 
+{funcoes_block}
+
 {rag_block}
 
 ## Ferramentas disponíveis
@@ -57,16 +65,6 @@ conhecimento.
   cada uma assim que o contato informar ou confirmar o dado correspondente
   (não precisa perguntar de novo o que já estiver na seção "Dados já
   registrados" acima).
-- registrar_disponibilidade_contato: chame quando o contato informar a data
-  e o horário em que pode conversar — ela já cria (ou remarca) o evento no
-  calendário. Não chame criar_evento_calendario de novo para o mesmo horário.
-- criar_card_kanban: cria/atualiza o card do contato no Kanban, com uma
-  descrição do lead escrita por você.
-- criar_evento_calendario: cria um evento no calendário para este contato
-  (para outros compromissos além do horário de conversa acima).
-- consultar_eventos_calendario: mostra os eventos já marcados com este
-  contato e os horários ocupados da agenda — use antes de propor/confirmar
-  um horário ou quando o contato perguntar o que já está marcado.
 - solicitar_atendimento_humano: chame sempre que o contato pedir
   explicitamente para falar com uma pessoa, ou quando a dúvida estiver fora
   do que você consegue resolver com segurança. Se você já souber a fila
@@ -140,21 +138,48 @@ já esteja em "Dados já registrados" acima):
    alta) -> atualizar_volumetria_atendimento
 4. Se já usou algum sistema de gerenciamento de WhatsApp para empresas
    -> atualizar_uso_sistema_whatsapp
-5. Uma data e um horário em que pode conversar
-   -> registrar_disponibilidade_contato (já cria o evento no calendário)
 
 Assim que o contato informar cada dado, chame a ferramenta correspondente
 imediatamente.
-
-Card no Kanban: assim que o contato responder o nome da empresa, chame
-criar_card_kanban com a descrição do lead. A cada dado novo coletado depois
-disso, chame criar_card_kanban de novo para atualizar a descrição.
-
 {metadados_adicionais_block}
-Quando todos os dados estiverem registrados (e o evento criado), confirme
-com o contato a data e o horário combinados e chame encerrar_conversa. Não
-continue fazendo perguntas depois disso.
+{encerramento}
 """
+
+ENCERRAMENTO_SEM_AGENDAMENTO = """Quando todos os dados estiverem registrados, agradeça, diga que a equipe vai
+dar continuidade e chame encerrar_conversa. Não continue fazendo perguntas
+depois disso."""
+
+ENCERRAMENTO_COM_AGENDAMENTO = """Quando todos os dados estiverem registrados e o evento estiver agendado (ver
+"Funções" abaixo), confirme com o contato a data e o horário combinados e
+chame encerrar_conversa. Não continue fazendo perguntas depois disso."""
+
+# Função CALENDAR_EVENT ligada no Console. O momento vem dos switches
+# runAtStart / runAfterMetadata (os dois podem estar ligados).
+FUNCAO_EVENTO_INSTRUCTION = """
+## Funções
+
+### Agendamento de evento
+
+Use agendar_evento para marcar um evento com o contato: pergunte o dia e o
+horário que ele prefere e chame a ferramenta. A agenda é checada na hora —
+se vier disponivel=false, explique de forma breve que esse horário não está
+livre e peça outro. Se a resposta trouxer "responsavel", você pode dizer ao
+contato com quem será. Chamar de novo na mesma conversa remarca o mesmo
+evento. consultar_eventos_calendario mostra os horários já ocupados, útil
+para sugerir alternativas.
+
+{momentos}
+"""
+
+EVENTO_NO_INICIO = """Quando: no início da conversa — logo depois de cumprimentar/se apresentar e
+ANTES da coleta de dados. Só siga para a coleta depois que o evento estiver
+agendado (ou se o contato disser que não quer agendar)."""
+
+EVENTO_APOS_COLETA = """Quando: depois que todos os dados da coleta (inclusive os adicionais)
+estiverem registrados, antes de encerrar a conversa."""
+
+EVENTO_CONFIRMAR_APOS_COLETA = """Depois da coleta, confirme com o contato se o dia e o horário agendados
+continuam bons; se ele quiser mudar, chame agendar_evento de novo."""
 
 # Metadados configurados no card "Metadados" do Agent Console (só os
 # ativos, via payload agent.metadataFields) — entram no mesmo roteiro de
@@ -209,7 +234,33 @@ def _build_data_atual_block() -> str:
     )
 
 
-def _campos_metadados(agent_info: dict) -> list[dict]:
+def funcoes_ativas(agent_info: dict) -> dict[str, dict]:
+    """Funções fixas ligadas no Console (payload agent.functions), por tipo:
+    {"CALENDAR_EVENT": {"inicio": bool, "apos_coleta": bool}, ...}. Só entram
+    as que têm pelo menos um momento ligado."""
+    ativas = {}
+    for funcao in agent_info.get("functions") or []:
+        inicio = bool(funcao.get("runAtStart"))
+        apos_coleta = bool(funcao.get("runAfterMetadata"))
+        if funcao.get("type") and (inicio or apos_coleta):
+            ativas[funcao["type"]] = {"inicio": inicio, "apos_coleta": apos_coleta}
+    return ativas
+
+
+def _build_funcao_evento_block(evento: dict | None) -> str:
+    if not evento:
+        return ""
+    momentos = []
+    if evento["inicio"]:
+        momentos.append(EVENTO_NO_INICIO)
+        if evento["apos_coleta"]:
+            momentos.append(EVENTO_CONFIRMAR_APOS_COLETA)
+    else:
+        momentos.append(EVENTO_APOS_COLETA)
+    return FUNCAO_EVENTO_INSTRUCTION.format(momentos="\n\n".join(momentos))
+
+
+def campos_metadados(agent_info: dict) -> list[dict]:
     """Metadados ativos do Agent Console (payload agent.metadataFields). Chaves
     que colidem com os dados fixos (CHAVES_METADATA) ficam de fora — esses já
     têm ferramenta e roteiro próprios."""
@@ -322,12 +373,15 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     else:
         fluxo_block = PRIMEIRO_CONTATO_INSTRUCTION
 
-    campos = _campos_metadados(agent_info)
+    campos = campos_metadados(agent_info)
     dados_conhecidos_block = _build_known_data_block(target_info, campos)
     personality_block = PERSONALITY_INSTRUCTION.format(personality=personality or PERSONALITY_VAZIA)
     rag_block = RAG_INSTRUCTION if rag_enabled else ""
+    funcoes = funcoes_ativas(agent_info)
+    evento = funcoes.get(FUNCAO_EVENTO)
     coleta_dados_block = COLETA_DADOS_INSTRUCTION.format(
         metadados_adicionais_block=_build_metadados_adicionais_block(campos),
+        encerramento=ENCERRAMENTO_COM_AGENDAMENTO if evento else ENCERRAMENTO_SEM_AGENDAMENTO,
     )
 
     instruction = BASE_INSTRUCTION.format(
@@ -335,6 +389,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         data_atual_block=_build_data_atual_block(),
         fluxo_block=fluxo_block,
         coleta_dados_block=coleta_dados_block,
+        funcoes_block=_build_funcao_evento_block(evento),
         dados_conhecidos_block=dados_conhecidos_block,
         personality_block=personality_block,
         rag_block=rag_block,
@@ -345,10 +400,6 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         atualizar_empresa_cliente,
         atualizar_volumetria_atendimento,
         atualizar_uso_sistema_whatsapp,
-        registrar_disponibilidade_contato,
-        criar_card_kanban,
-        criar_evento_calendario,
-        consultar_eventos_calendario,
         solicitar_atendimento_humano,
         encerrar_conversa,
         parar_envio_campanhas,
@@ -359,6 +410,9 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
 
     if campos:
         tools.append(_build_metadado_tool(campos))
+
+    if evento:
+        tools.extend([agendar_evento, consultar_eventos_calendario])
 
     return Agent(
         # Nome interno do ADK — fixo, não é o nome de exibição do agente (que

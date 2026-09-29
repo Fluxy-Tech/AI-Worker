@@ -4,16 +4,91 @@ import os
 from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.runners import Runner
 from google.genai import types
-from src.services.adk.infos import CHAVES_METADATA, APP_NAME, GOOGLE_ADK_MODEL, STATE_METADADOS_ADICIONAIS
+from src.services.adk.infos import (
+    APP_NAME,
+    CHAVES_COLETA_FIXA,
+    CHAVES_METADATA,
+    FUNCAO_CARD,
+    GOOGLE_ADK_MODEL,
+    STATE_METADADOS_ADICIONAIS,
+)
 from src.infra.adk.session_service import get_session_service
 from src.infra.agent_api.client import (
     bloquear_campanhas_contato,
-    criar_card_crm,
+    comentar_card_crm,
     resetar_metadados_contato,
     sincronizar_metadados_contato,
 )
-from src.services.adk.agent import build_agent
-from src.services.adk.tools import STATE_CARD_CRM_ID, descricao_lead
+from src.services.adk.agent import LABELS_METADATA, build_agent, campos_metadados, funcoes_ativas
+
+
+def _dados_do_contato(target_info: dict, state: dict) -> dict:
+    """Tudo que já se sabe do contato: Target.metadata do payload + nome do
+    perfil do WhatsApp + o que foi coletado nesta sessão (state)."""
+    metadata = target_info.get("metadata") or {}
+    dados = {k: v for k, v in metadata.items() if v not in (None, "")}
+    if target_info.get("name") and not dados.get("nome"):
+        dados["nome"] = target_info["name"]
+    dados.update(state.get(STATE_METADADOS_ADICIONAIS) or {})
+    dados.update({k: state[k] for k in CHAVES_METADATA if state.get(k)})
+    return dados
+
+
+def _coleta_completa(dados: dict, campos: list[dict]) -> bool:
+    chaves = list(CHAVES_COLETA_FIXA) + [c["chave"] for c in campos]
+    return all(dados.get(chave) for chave in chaves)
+
+
+def _formatar_dados(dados: dict, campos: list[dict]) -> str:
+    labels = dict(LABELS_METADATA)
+    labels.update({c["chave"]: c["nome"] for c in campos})
+    chaves = list(CHAVES_METADATA) + [c["chave"] for c in campos]
+    return "\n".join(f"- {labels.get(k, k)}: {dados[k]}" for k in chaves if dados.get(k))
+
+
+def _executar_funcao_card(
+    user_id: str,
+    session_id: str,
+    agent_config: dict,
+    target_info: dict,
+    pergunta: str,
+    inicio_conversa: bool,
+    estado_antes: dict,
+    estado_depois: dict,
+) -> None:
+    """Função KANBAN_CARD (card "Funções" do Console): cria o card do contato
+    e comenta nele os dados da conversa — determinística, roda aqui no runner
+    e não depende do modelo chamar uma tool.
+    - Início da conversa: primeiro turno de uma sessão ADK nova.
+    - Após a coleta: no turno em que a coleta (fixa + metadados ativos)
+      passou de incompleta pra completa."""
+    card = funcoes_ativas(agent_config).get(FUNCAO_CARD)
+    if not card:
+        return
+
+    campos = campos_metadados(agent_config)
+    dados_antes = _dados_do_contato(target_info, estado_antes)
+    dados_depois = _dados_do_contato(target_info, estado_depois)
+
+    comentarios = []
+    if card["inicio"] and inicio_conversa:
+        texto = f"Nova conversa iniciada pelo contato.\n\nMensagem do contato:\n{pergunta}"
+        conhecidos = _formatar_dados(dados_depois, campos)
+        if conhecidos:
+            texto += f"\n\nDados já conhecidos:\n{conhecidos}"
+        comentarios.append(texto)
+    if card["apos_coleta"] and _coleta_completa(dados_depois, campos) and not _coleta_completa(dados_antes, campos):
+        comentarios.append(
+            f"Coleta de dados concluída.\n\nDados coletados:\n{_formatar_dados(dados_depois, campos)}"
+            f"\n\nÚltima mensagem do contato:\n{pergunta}"
+        )
+
+    for comentario in comentarios:
+        try:
+            comentar_card_crm(user_id, comentario)
+            print(f"[session={session_id} user={user_id}] funcao card: comentario registrado no card")
+        except Exception as e:
+            print(f"[session={session_id} user={user_id}] funcao card: falha ao comentar no card: {e}")
 
 
 class ResultadoResposta:
@@ -53,6 +128,13 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
     
     async with get_session_service() as session_service:
         await _abrir_sessao(session_service, user_id, session_id)
+
+        # Foto da sessão antes do turno — "início da conversa" = sessão ADK
+        # sem nenhum evento ainda; o state de antes serve pra saber se a
+        # coleta acabou de ficar completa neste turno (função de card).
+        sessao_inicial = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        inicio_conversa = not (sessao_inicial and sessao_inicial.events)
+        estado_antes = dict(sessao_inicial.state) if sessao_inicial else {}
 
         rag_enabled = bool(agent_config.get("ragEnabled"))
         
@@ -121,18 +203,16 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             metadata["contato_iniciado"] = True
             sincronizar_metadados_contato(user_id, metadata)
 
-            # Regra do piloto: todo contato que respondeu pelo menos o nome
-            # da empresa ganha card no Kanban. O modelo deveria ter chamado
-            # criar_card_kanban (com a descrição no tom da personalidade) —
-            # se esqueceu, cria aqui com o resumo determinístico dos dados.
-            # Idempotente no Agent-Api, então repetir num turno seguinte não
-            # duplica o card.
-            if sessao_final.state.get("nome_empresa") and not sessao_final.state.get(STATE_CARD_CRM_ID):
-                try:
-                    criar_card_crm(user_id, descricao_lead(sessao_final.state))
-                    print(f"[session={session_id} user={user_id}] card CRM criado pelo fallback do runner")
-                except Exception as e:
-                    print(f"[session={session_id} user={user_id}] falha no fallback de card CRM: {e}")
+            _executar_funcao_card(
+                user_id,
+                session_id,
+                agent_config,
+                target_info,
+                pergunta,
+                inicio_conversa,
+                estado_antes,
+                dict(sessao_final.state),
+            )
 
         # Sem isso, handoff_requested/closing_requested ficam GRUDADOS pra
         # sempre no state da sessão do ADK (nada os limpa depois de usados) —

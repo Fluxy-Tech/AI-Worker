@@ -26,6 +26,10 @@ _agent_config = {
     "metadataFields": [
         {"name": "Cidade", "nameToAgent": "cidade", "rule": "Pergunte em qual cidade o contato mora."},
     ],
+    # Mesmo formato de agent.functions no payload (card "Funções" do Console).
+    "functions": [
+        {"type": "CALENDAR_EVENT", "runAtStart": False, "runAfterMetadata": True},
+    ],
 }
 
 # Troque metadata/name pra simular um contato que já tem histórico e/ou dados

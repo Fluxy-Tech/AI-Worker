@@ -7,9 +7,8 @@ from google.adk.tools import ToolContext
 from src.infra.agent_api import client as agent_api
 from src.services.adk.infos import AGENT_TIMEZONE
 
-# Chaves internas do state da sessão (NÃO entram em CHAVES_METADATA, então
-# não vão pro Target.metadata) — evitam card/evento duplicado na mesma sessão.
-STATE_CARD_CRM_ID = "card_crm_id"
+# Chave interna do state da sessão (NÃO entra em CHAVES_METADATA, então não
+# vai pro Target.metadata) — faz agendar_evento remarcar em vez de duplicar.
 STATE_EVENTO_CALENDARIO_ID = "evento_calendario_id"
 
 
@@ -97,38 +96,6 @@ def atualizar_uso_sistema_whatsapp(
     return {"ok": True, "ja_usou_sistema_whatsapp": valor}
 
 
-def registrar_disponibilidade_contato(tool_context: ToolContext, data_hora: str) -> dict:
-    """Registra a data e o horário em que o contato disse que pode conversar
-    e JÁ CRIA (ou remarca) o evento no calendário para ele. data_hora no
-    formato AAAA-MM-DDTHH:MM, no horário local (ex: "2026-09-30T14:00") —
-    converta expressões como "amanhã às 14h" usando a data atual informada
-    na sua instrução. Se o contato der só o dia ou só um período vago,
-    pergunte o horário exato antes de chamar."""
-    try:
-        quando = parse_data_hora_futura(data_hora)
-    except ValueError as e:
-        return {"ok": False, "erro": str(e)}
-
-    tool_context.state["data_horario_contato"] = quando.strftime("%d/%m/%Y %H:%M")
-
-    # Contato corrigiu o horário na mesma conversa -> remarca o evento já
-    # criado em vez de deixar dois na agenda.
-    resultado_evento = salvar_evento_calendario(
-        tool_context,
-        titulo=titulo_evento_contato(tool_context.state),
-        quando=quando,
-        descricao=descricao_lead(tool_context.state),
-        evento_id=tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
-    )
-    if resultado_evento.get("evento_id"):
-        tool_context.state[STATE_EVENTO_CALENDARIO_ID] = resultado_evento["evento_id"]
-    return {
-        "ok": resultado_evento.get("ok", False),
-        "data_horario_contato": tool_context.state["data_horario_contato"],
-        "evento": resultado_evento,
-    }
-
-
 # ---------- FUNÇÕES PADRÃO: KANBAN (CRM) E CALENDÁRIO ----------
 # Genéricas de propósito — qualquer agente pode incluir estas tools. O
 # contato é sempre o da conversa (tool_context.user_id = Target.id), o modelo
@@ -175,60 +142,52 @@ def descricao_lead(state) -> str:
     return "\n".join(linhas)
 
 
-def criar_card_kanban(tool_context: ToolContext, descricao: str) -> dict:
-    """Cria o card deste contato no Kanban (CRM) da empresa — ou, se ele já
-    tiver card, atualiza a descrição. Escreva em descricao um resumo do lead
-    seguindo as orientações da sua personalidade (o que registrar e como),
-    incluindo os dados já coletados. Pode chamar de novo sempre que coletar
-    um dado novo, para manter a descrição atualizada."""
-    try:
-        resultado = agent_api.criar_card_crm(tool_context.user_id, descricao)
-    except Exception as e:
-        print(f"[julia] Falha ao criar card no CRM do contato {tool_context.user_id}: {e}")
-        return {"ok": False, "erro": "Não foi possível criar o card agora."}
+def agendar_evento(tool_context: ToolContext, data_hora: str) -> dict:
+    """Agenda o evento com o contato no dia e horário que ele escolheu.
+    data_hora no formato AAAA-MM-DDTHH:MM, no horário local (ex:
+    "2026-09-30T14:00") — converta expressões como "amanhã às 14h" usando a
+    data atual informada na sua instrução. Se o contato der só o dia ou um
+    período vago, pergunte o horário exato antes de chamar.
 
-    card = resultado.get("card") or {}
-    if card.get("id"):
-        tool_context.state[STATE_CARD_CRM_ID] = card["id"]
-    return {"ok": True, "card_criado": bool(resultado.get("created")), "card_id": card.get("id")}
-
-
-def salvar_evento_calendario(
-    tool_context: ToolContext,
-    titulo: str,
-    quando: datetime,
-    descricao: Optional[str] = None,
-    evento_id: Optional[str] = None,
-) -> dict:
-    """Função padrão (não é tool): cria o evento do contato da conversa, ou
-    remarca `evento_id` se vier preenchido."""
-    target_id = tool_context.user_id
-    try:
-        if evento_id:
-            evento = agent_api.atualizar_evento_calendario(
-                target_id, evento_id, nome=titulo, data_evento_iso=quando.isoformat(), descricao=descricao
-            )
-            acao = "remarcado"
-        else:
-            evento = agent_api.criar_evento_calendario(target_id, titulo, quando.isoformat(), descricao)
-            acao = "criado"
-    except Exception as e:
-        print(f"[julia] Falha ao criar/remarcar evento do contato {target_id}: {e}")
-        return {"ok": False, "erro": "Não foi possível registrar o evento no calendário agora."}
-
-    return {"ok": True, "acao": acao, "evento_id": evento.get("id"), "data_hora": quando.strftime("%d/%m/%Y %H:%M")}
-
-
-def criar_evento_calendario(
-    tool_context: ToolContext, titulo: str, data_hora: str, descricao: Optional[str] = None
-) -> dict:
-    """Cria um evento no calendário da empresa para este contato. data_hora no
-    formato AAAA-MM-DDTHH:MM, no horário local (ex: "2026-09-30T14:00")."""
+    A agenda é checada na hora: se o horário estiver indisponível, a resposta
+    vem com disponivel=false e o motivo — peça outro dia/horário ao contato e
+    chame de novo. Chamar de novo na mesma conversa remarca o evento já
+    agendado (não cria outro)."""
     try:
         quando = parse_data_hora_futura(data_hora)
     except ValueError as e:
         return {"ok": False, "erro": str(e)}
-    return salvar_evento_calendario(tool_context, titulo, quando, descricao)
+
+    target_id = tool_context.user_id
+    try:
+        resultado = agent_api.agendar_evento_calendario(
+            target_id,
+            nome=titulo_evento_contato(tool_context.state),
+            data_evento_iso=quando.isoformat(),
+            descricao=descricao_lead(tool_context.state) or None,
+            evento_id=tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
+        )
+    except agent_api.HorarioIndisponivelError as e:
+        return {"ok": False, "disponivel": False, "motivo": str(e)}
+    except Exception as e:
+        print(f"[piloto] Falha ao agendar evento do contato {target_id}: {e}")
+        return {"ok": False, "erro": "Não foi possível acessar a agenda agora."}
+
+    evento = resultado.get("event") or {}
+    if evento.get("id"):
+        tool_context.state[STATE_EVENTO_CALENDARIO_ID] = evento["id"]
+    tool_context.state["data_horario_contato"] = quando.strftime("%d/%m/%Y %H:%M")
+
+    resposta = {
+        "ok": True,
+        "disponivel": True,
+        "acao": "remarcado" if resultado.get("rescheduled") else "agendado",
+        "data_hora": tool_context.state["data_horario_contato"],
+    }
+    responsavel = (evento.get("user") or {}).get("name")
+    if responsavel:
+        resposta["responsavel"] = responsavel
+    return resposta
 
 
 def consultar_eventos_calendario(

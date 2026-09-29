@@ -142,17 +142,38 @@ def descricao_lead(state) -> str:
     return "\n".join(linhas)
 
 
-def agendar_evento(tool_context: ToolContext, data_hora: str) -> dict:
+# Limites do Agent-Api (internal.routes.ts#calendarEventScheduleSchema).
+LIMITE_NOME_EVENTO = 200
+LIMITE_DESCRICAO_EVENTO = 5000
+
+
+def _descricao_evento(descricao: str, state) -> str | None:
+    """Descrição escrita pelo modelo + os dados coletados do lead, pra quem
+    for atender ter tudo no evento."""
+    partes = [p for p in ((descricao or "").strip(), descricao_lead(state)) if p]
+    if len(partes) == 2:
+        partes[1] = f"Dados do lead:\n{partes[1]}"
+    return "\n\n".join(partes)[:LIMITE_DESCRICAO_EVENTO] or None
+
+
+def agendar_evento(tool_context: ToolContext, data_hora: str, nome: str, descricao: str) -> dict:
     """Agenda o evento com o contato no dia e horário que ele escolheu.
     data_hora no formato AAAA-MM-DDTHH:MM, no horário local (ex:
     "2026-09-30T14:00") — converta expressões como "amanhã às 14h" usando a
     data atual informada na sua instrução. Se o contato der só o dia ou um
     período vago, pergunte o horário exato antes de chamar.
 
+    nome: título curto e claro do evento, que diga o que é e com quem (ex:
+    "Demonstração da plataforma - Ana (Loja X)").
+    descricao: 1 a 3 frases dizendo o objetivo do evento e o contexto da
+    conversa que a equipe precisa saber antes (interesse, dúvidas, o que foi
+    combinado). Os dados coletados do contato já são anexados
+    automaticamente — não precisa repeti-los.
+
     A agenda é checada na hora: se o horário estiver indisponível, a resposta
     vem com disponivel=false e o motivo — peça outro dia/horário ao contato e
     chame de novo. Chamar de novo na mesma conversa remarca o evento já
-    agendado (não cria outro)."""
+    agendado (não cria outro) e atualiza nome e descrição."""
     try:
         quando = parse_data_hora_futura(data_hora)
     except ValueError as e:
@@ -162,9 +183,9 @@ def agendar_evento(tool_context: ToolContext, data_hora: str) -> dict:
     try:
         resultado = agent_api.agendar_evento_calendario(
             target_id,
-            nome=titulo_evento_contato(tool_context.state),
+            nome=((nome or "").strip() or titulo_evento_contato(tool_context.state))[:LIMITE_NOME_EVENTO],
             data_evento_iso=quando.isoformat(),
-            descricao=descricao_lead(tool_context.state) or None,
+            descricao=_descricao_evento(descricao, tool_context.state),
             evento_id=tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
         )
     except agent_api.HorarioIndisponivelError as e:

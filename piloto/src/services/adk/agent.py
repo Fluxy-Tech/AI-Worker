@@ -174,7 +174,9 @@ FUNCAO_EVENTO_INSTRUCTION = """
 ### Agendamento de evento
 
 Use agendar_evento para marcar um evento com o contato: pergunte o dia e o
-horário que ele prefere e chame a ferramenta. A agenda é checada na hora —
+horário que ele prefere e chame a ferramenta. Dê sempre um nome ao evento
+(curto, dizendo o que é e com quem) e uma descrição com o objetivo e o
+contexto da conversa, escritos por você. A agenda é checada na hora —
 se vier disponivel=false, explique de forma breve que esse horário não está
 livre e peça outro. Se a resposta trouxer "responsavel", você pode dizer ao
 contato com quem será. Chamar de novo na mesma conversa remarca o mesmo

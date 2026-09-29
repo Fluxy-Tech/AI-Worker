@@ -23,6 +23,7 @@ agrupado/debounced por sessão em janelas de 10s):
     "closingMessage", "closingEnabled",
     "errorMessage", "errorEnabled",
     "personality", "ragEnabled",    # só usados aqui (worker genérico)
+    "metadataFields": [{"name", "nameToAgent", "rule"}],  # só os ativos — coletados via registrar_metadado
   },
   "messagingSession": {"id", "startedAt"},
   "messages": [{"mongoMessageId", "externalMessageId", "type", "text", "timestamp"}, ...]

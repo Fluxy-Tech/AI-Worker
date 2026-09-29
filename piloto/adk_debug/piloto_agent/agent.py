@@ -19,9 +19,13 @@ from src.services.adk.agent import build_agent
 
 _agent_config = {
     "id": "agent-teste-local",
-    "name": "Fly",
+    "name": "Assistente Teste",
     "personality": "Simpática, objetiva e prestativa. Trate o cliente pelo nome quando souber.",
     "ragEnabled": False,
+    # Mesmo formato de agent.metadataFields no payload (só os ativos).
+    "metadataFields": [
+        {"name": "Cidade", "nameToAgent": "cidade", "rule": "Pergunte em qual cidade o contato mora."},
+    ],
 }
 
 # Troque metadata/name pra simular um contato que já tem histórico e/ou dados

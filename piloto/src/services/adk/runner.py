@@ -4,7 +4,7 @@ import os
 from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.runners import Runner
 from google.genai import types
-from src.services.adk.infos import CHAVES_METADATA, APP_NAME, GOOGLE_ADK_MODEL
+from src.services.adk.infos import CHAVES_METADATA, APP_NAME, GOOGLE_ADK_MODEL, STATE_METADADOS_ADICIONAIS
 from src.infra.adk.session_service import get_session_service
 from src.infra.agent_api.client import (
     bloquear_campanhas_contato,
@@ -114,7 +114,10 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             # ter sido chamada) — é o sinal que agent._tem_historico usa pra
             # saber se já trocamos mensagem com este contato antes, e por
             # isso não pode depender do modelo lembrar de chamar uma tool.
-            metadata = {chave: sessao_final.state[chave] for chave in CHAVES_METADATA if chave in sessao_final.state}
+            # Metadados do Agent Console (registrar_metadado) primeiro, pra que
+            # nunca sobrescrevam os fixos nem contato_iniciado.
+            metadata = dict(sessao_final.state.get(STATE_METADADOS_ADICIONAIS) or {})
+            metadata.update({chave: sessao_final.state[chave] for chave in CHAVES_METADATA if chave in sessao_final.state})
             metadata["contato_iniciado"] = True
             sincronizar_metadados_contato(user_id, metadata)
 

@@ -15,6 +15,11 @@ CHAVES_METADATA = (
     "data_horario_contato",
 )
 
+# Chave do state da sessão onde a tool registrar_metadado guarda os metadados
+# configurados no Agent Console ({nameToAgent: valor}) — o runner mescla em
+# Target.metadata junto com CHAVES_METADATA.
+STATE_METADADOS_ADICIONAIS = "metadados_adicionais"
+
 # Nome do agente
 APP_NAME = os.getenv("GOOGLE_ADK_APP_NAME", "piloto")
 

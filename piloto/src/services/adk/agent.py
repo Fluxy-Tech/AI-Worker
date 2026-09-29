@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
 
-from src.services.adk.infos import AGENT_TIMEZONE, CHAVES_METADATA, GOOGLE_ADK_MODEL
+from src.services.adk.infos import AGENT_TIMEZONE, CHAVES_METADATA, GOOGLE_ADK_MODEL, STATE_METADADOS_ADICIONAIS
 from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
     atualizar_empresa_cliente,
@@ -20,19 +20,35 @@ from src.services.adk.tools import (
     solicitar_atendimento_humano,
 )
 
+# Blocos montados em build_agent:
+# - data_atual_block: data/hora atual — base pra converter "amanhã às 14h" em data
+# - personality_block: instruções do Agent Console (empresa, o que pode falar,
+#   personalidade) — é o que muda de um agente pro outro
+# - dados_conhecidos_block: dados já salvos no metadata do contato (vem antes
+#   do fluxo/coleta, que se referem a ele como "acima")
+# - fluxo_block: primeiro contato ou conversa com histórico (ver _tem_historico)
+# - coleta_dados_block: roteiro fixo de coleta de dados do contato
+# - rag_block: uso da base de conhecimento (só com ragEnabled)
 BASE_INSTRUCTION = """
 Você é {nome}, atendendo via WhatsApp.
 Responda de forma natural, clara e objetiva, sempre em português. Faça uma
 pergunta por vez quando precisar de mais informação do contato — nunca
 acumule várias perguntas na mesma mensagem. Nunca invente informações que
-você não tenha certeza.
+você não tenha certeza: sobre a empresa, produtos, serviços e preços, fale
+apenas o que estiver nas instruções do agente abaixo ou na base de
+conhecimento.
 
-{data_atual_block} # Data/hora atual — base pra converter "amanhã às 14h" em data
-{fluxo_block} # Fluxo de instrução do primeiro contato ou apos o primeiro contato
-{coleta_dados_block} # Roteiro obrigatório de coleta de dados do contato
-{dados_conhecidos_block} # Dados salvos no contato no campo do metadado
-{personality_block} # Personalidade vinda da interface agent consoloe
-{rag_block} # Dados coletados no Rag
+{data_atual_block}
+
+{personality_block}
+
+{dados_conhecidos_block}
+
+{fluxo_block}
+
+{coleta_dados_block}
+
+{rag_block}
 
 ## Ferramentas disponíveis
 
@@ -61,6 +77,26 @@ você não tenha certeza.
   não receber mais campanhas/mensagens em massa (ex: "não quero mais
   receber", "pare de me mandar mensagem", "me remova da lista").
 """
+
+# Campo "personality" do Agent Console — texto livre onde a empresa define
+# quem o agente representa, o que pode/não pode falar e o tom. O roteiro de
+# coleta de dados e as ferramentas continuam fixos, fora do controle dele.
+PERSONALITY_INSTRUCTION = """
+## Instruções do agente
+
+As instruções abaixo foram definidas pela empresa que você representa:
+informações da empresa, o que você pode e o que não pode falar, e como deve
+se comunicar. Siga-as em tudo, exceto no roteiro de coleta de dados e no uso
+das ferramentas, que são obrigatórios.
+
+{personality}
+"""
+
+PERSONALITY_VAZIA = (
+    "Nenhuma instrução específica foi configurada. Não fale sobre produtos, "
+    "serviços, preços ou informações da empresa; se o contato perguntar, "
+    "ofereça atendimento humano."
+)
 
 RAG_INSTRUCTION = """
 Você tem uma base de conhecimento anexada. Sempre que a pergunta do cliente
@@ -114,9 +150,22 @@ Card no Kanban: assim que o contato responder o nome da empresa, chame
 criar_card_kanban com a descrição do lead. A cada dado novo coletado depois
 disso, chame criar_card_kanban de novo para atualizar a descrição.
 
+{metadados_adicionais_block}
 Quando todos os dados estiverem registrados (e o evento criado), confirme
 com o contato a data e o horário combinados e chame encerrar_conversa. Não
 continue fazendo perguntas depois disso.
+"""
+
+# Metadados configurados no card "Metadados" do Agent Console (só os
+# ativos, via payload agent.metadataFields) — entram no mesmo roteiro de
+# coleta, depois dos dados fixos acima.
+METADADOS_ADICIONAIS_INSTRUCTION = """
+Dados adicionais: colete também estes dados, um de cada vez, seguindo a
+regra de cada um (pule os que já estiverem em "Dados já registrados"). Assim
+que o contato informar um deles, chame registrar_metadado com a chave
+exata indicada:
+
+{itens}
 """
 
 
@@ -160,11 +209,30 @@ def _build_data_atual_block() -> str:
     )
 
 
-def _build_known_data_block(target_info: dict) -> str: # Função de coletar os metadados e passar para o agente
+def _campos_metadados(agent_info: dict) -> list[dict]:
+    """Metadados ativos do Agent Console (payload agent.metadataFields). Chaves
+    que colidem com os dados fixos (CHAVES_METADATA) ficam de fora — esses já
+    têm ferramenta e roteiro próprios."""
+    campos = []
+    for campo in agent_info.get("metadataFields") or []:
+        chave = (campo.get("nameToAgent") or "").strip()
+        if chave and chave not in CHAVES_METADATA:
+            campos.append({"chave": chave, "nome": campo.get("name") or chave, "regra": (campo.get("rule") or "").strip()})
+    return campos
+
+
+def _build_metadados_adicionais_block(campos: list[dict]) -> str:
+    if not campos:
+        return ""
+    itens = "\n".join(f"- {c['chave']} ({c['nome']}): {c['regra']}" for c in campos)
+    return METADADOS_ADICIONAIS_INSTRUCTION.format(itens=itens)
+
+
+def _build_known_data_block(target_info: dict, campos: list[dict]) -> str: # Função de coletar os metadados e passar para o agente
     """Dados que já existem no cadastro do contato (nome vindo do perfil do
-    WhatsApp ou qualquer um dos CHAVES_METADATA já registrado em conversa
-    anterior via atualizar_*_cliente) — evita que o agente pergunte de novo
-    algo que já sabe, mesmo numa sessão nova."""
+    WhatsApp, qualquer um dos CHAVES_METADATA ou dos metadados do Agent
+    Console já registrado em conversa anterior) — evita que o agente pergunte
+    de novo algo que já sabe, mesmo numa sessão nova."""
     metadata = target_info.get("metadata") or {}
     nome = target_info.get("name") or metadata.get("nome")
 
@@ -178,13 +246,46 @@ def _build_known_data_block(target_info: dict) -> str: # Função de coletar os 
         if valor:
             dados[chave] = valor
 
+    labels = dict(LABELS_METADATA)
+    for campo in campos:
+        valor = metadata.get(campo["chave"])
+        if valor:
+            dados[campo["chave"]] = valor
+            labels[campo["chave"]] = f"{campo['nome']} ({campo['chave']})"
+
     if not dados:
         return "Nenhum dado deste contato foi registrado ainda."
 
     linhas = ["Dados já registrados deste contato — não pergunte de novo o que já está aqui:"]
     for chave, valor in dados.items():
-        linhas.append(f"- {LABELS_METADATA.get(chave, chave)}: {valor}")
+        linhas.append(f"- {labels.get(chave, chave)}: {valor}")
     return "\n".join(linhas)
+
+
+def _build_metadado_tool(campos: list[dict]):
+    """Closure pelo mesmo motivo da tool de RAG: as chaves válidas mudam por
+    agente (vêm do payload). Grava em STATE_METADADOS_ADICIONAIS, que o runner
+    sincroniza em Target.metadata ao fim do turno."""
+    chaves_validas = {c["chave"] for c in campos}
+
+    def registrar_metadado(tool_context: ToolContext, chave: str, valor: str) -> dict:
+        """Registra um dos dados adicionais que você deve coletar do contato
+        (listados em "Dados adicionais" na sua instrução). Use a chave exata
+        indicada lá e o valor informado/confirmado pelo contato."""
+        chave = (chave or "").strip()
+        if chave not in chaves_validas:
+            return {"ok": False, "erro": f"Chave inválida. Use uma destas: {', '.join(sorted(chaves_validas))}."}
+        valor = str(valor or "").strip()
+        if not valor:
+            return {"ok": False, "erro": "O valor não pode ser vazio."}
+        # Reatribui o dict inteiro (em vez de mutar) pro ADK registrar o delta
+        # de state e persistir na sessão.
+        metadados = dict(tool_context.state.get(STATE_METADADOS_ADICIONAIS) or {})
+        metadados[chave] = valor
+        tool_context.state[STATE_METADADOS_ADICIONAIS] = metadados
+        return {"ok": True, chave: valor}
+
+    return registrar_metadado
 
 
 def _build_rag_tool(agent_id: str, openai_api_key: str | None): # Retorna os chunks encontratos de acordo com a pergunta do usuario
@@ -221,15 +322,19 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     else:
         fluxo_block = PRIMEIRO_CONTATO_INSTRUCTION
 
-    dados_conhecidos_block = _build_known_data_block(target_info)
-    personality_block = f"Sua personalidade e forma de se comunicar: {personality}" if personality else ""
+    campos = _campos_metadados(agent_info)
+    dados_conhecidos_block = _build_known_data_block(target_info, campos)
+    personality_block = PERSONALITY_INSTRUCTION.format(personality=personality or PERSONALITY_VAZIA)
     rag_block = RAG_INSTRUCTION if rag_enabled else ""
+    coleta_dados_block = COLETA_DADOS_INSTRUCTION.format(
+        metadados_adicionais_block=_build_metadados_adicionais_block(campos),
+    )
 
     instruction = BASE_INSTRUCTION.format(
         nome=nome,
         data_atual_block=_build_data_atual_block(),
         fluxo_block=fluxo_block,
-        coleta_dados_block=COLETA_DADOS_INSTRUCTION,
+        coleta_dados_block=coleta_dados_block,
         dados_conhecidos_block=dados_conhecidos_block,
         personality_block=personality_block,
         rag_block=rag_block,
@@ -252,6 +357,9 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     if rag_enabled:
         tools.append(_build_rag_tool(agent_info["id"], agent_info.get("openaiToken")))
 
+    if campos:
+        tools.append(_build_metadado_tool(campos))
+
     return Agent(
         # Nome interno do ADK — fixo, não é o nome de exibição do agente (que
         # pode ter espaços/acentos, ex: "Assistente Virtual"). O nome de
@@ -259,6 +367,10 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         name="recepcionista_agent",
         model=GOOGLE_ADK_MODEL,
         description="Agente de atendimento via WhatsApp.",
-        instruction=instruction,
+        # Como função (InstructionProvider) e não string: o ADK só troca
+        # {chave} por valores do state em instrução string, e levantaria
+        # KeyError se a personalidade ou a regra de um metadado (texto livre
+        # do Agent Console) tivesse algo como "{cidade}".
+        instruction=lambda _ctx: instruction,
         tools=tools,
     )

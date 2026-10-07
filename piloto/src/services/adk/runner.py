@@ -17,6 +17,7 @@ from src.infra.agent_api.client import (
     bloquear_campanhas_contato,
     comentar_card_crm,
     gerar_resumo_conversa,
+    registrar_tokens,
     resetar_metadados_contato,
     sincronizar_metadados_contato,
 )
@@ -103,7 +104,7 @@ def _executar_funcao_card(
         return
 
     # Um resumo só por turno, mesmo que os dois momentos caiam juntos.
-    resumo = gerar_resumo_conversa(_transcricao(eventos), agent_config.get("openaiToken"))
+    resumo = gerar_resumo_conversa(_transcricao(eventos), agent_config.get("openaiToken"), agent_config.get("id"))
     dados = _formatar_dados(dados_depois, campos)
 
     for titulo in titulos:
@@ -175,8 +176,14 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
         mensagem = types.Content(role="user", parts=[types.Part(text=pergunta)])
 
         resposta_final = ""
+        # Soma do consumo de todas as chamadas ao Gemini do turno (o ADK pode
+        # chamar o modelo mais de uma vez quando há tool calls) — vira uma
+        # linha de Token (origem ADK) só, no fim do turno.
+        tokens_adk = 0
 
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=mensagem):
+            if event.usage_metadata and event.usage_metadata.total_token_count:
+                tokens_adk += event.usage_metadata.total_token_count
             calls = event.get_function_calls() if hasattr(event, "get_function_calls") else []
             if calls:
                 nomes = [c.name for c in calls]
@@ -188,6 +195,9 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             f"[session={session_id} user={user_id}] loop do runner terminou, "
             f"resposta_final='{resposta_final[:200]}'"
         )
+
+        print(f"[session={session_id} user={user_id}] tokens ADK no turno: {tokens_adk}")
+        registrar_tokens(agent_config.get("id"), "ADK", tokens_adk)
 
         sessao_final = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
 

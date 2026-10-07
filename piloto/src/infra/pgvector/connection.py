@@ -1,5 +1,6 @@
 import os
 
+import tiktoken
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
@@ -19,6 +20,25 @@ def get_embeddings(api_key: str | None = None) -> OpenAIEmbeddings:
     if key not in _embeddings_cache:
         _embeddings_cache[key] = OpenAIEmbeddings(model="text-embedding-3-small", api_key=key)
     return _embeddings_cache[key]
+
+
+_EMBEDDING_ENCODING = None
+
+
+def contar_tokens_embedding(textos: list[str]) -> int:
+    """Tokens que a OpenAI cobra pra gerar o embedding desses textos — o
+    OpenAIEmbeddings do langchain não devolve o `usage` da resposta, então a
+    contagem é feita localmente com o mesmo tokenizer do modelo
+    (text-embedding-3-small → cl100k_base). 0 se o tokenizer falhar: a
+    métrica de consumo é best-effort, nunca pode derrubar busca/ingestão."""
+    global _EMBEDDING_ENCODING
+    try:
+        if _EMBEDDING_ENCODING is None:
+            _EMBEDDING_ENCODING = tiktoken.encoding_for_model("text-embedding-3-small")
+        return sum(len(_EMBEDDING_ENCODING.encode(texto)) for texto in textos)
+    except Exception as e:
+        print(f"[julia] Falha ao contar tokens de embedding: {e}")
+        return 0
 
 
 # Coleção única compartilhada por TODOS os agentes genéricos (diferente do

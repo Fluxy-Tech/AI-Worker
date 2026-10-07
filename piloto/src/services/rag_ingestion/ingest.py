@@ -7,8 +7,8 @@ import docx2txt
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
-from src.infra.agent_api.client import update_rag_document_status
-from src.infra.pgvector.connection import get_vector_store
+from src.infra.agent_api.client import registrar_tokens, update_rag_document_status
+from src.infra.pgvector.connection import contar_tokens_embedding, get_vector_store
 from src.infra.s3.client import download_object
 
 # unstructured.partition.auto seria a opção "genérica" (detecta o formato
@@ -77,6 +77,7 @@ def run_ingestion(payload: dict) -> None:
         ]
 
         get_vector_store().add_texts(texts=chunks, metadatas=metadatas)
+        registrar_tokens(payload["agentId"], "OPENAI", contar_tokens_embedding(chunks))
 
         update_rag_document_status(rag_document_id, "READY", chunk_count=len(chunks))
         print(f"[julia] Ingestão concluída: ragDocumentId={rag_document_id} chunks={len(chunks)}")

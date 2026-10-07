@@ -32,6 +32,30 @@ def _get_openai_client(api_key: str | None = None) -> OpenAI:
     return _openai_clients[key]
 
 
+def registrar_tokens(agent_id: str | None, origem: str, quantidade: int | None) -> None:
+    """Grava o consumo de tokens de uma chamada de LLM feita em nome do agente
+    (origem "ADK" = geração via Google ADK/Gemini, "OPENAI" = chamadas diretas
+    à OpenAI e embeddings do RAG) — alimenta as métricas de consumo da tela de
+    Agentes do Agent Console. Best-effort: uma falha aqui nunca pode derrubar
+    a conversa."""
+    if not agent_id or not quantidade:
+        return
+    try:
+        httpx.post(
+            f"{BASE_URL}/internal/agents/{agent_id}/tokens",
+            json={"origin": origem, "quantity": int(quantidade)},
+            headers={"x-internal-api-key": INTERNAL_API_KEY},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[julia] Falha ao registrar consumo de tokens do agente {agent_id}: {e}")
+
+
+def _registrar_uso_openai(agent_id: str | None, response) -> None:
+    usage = getattr(response, "usage", None)
+    registrar_tokens(agent_id, "OPENAI", getattr(usage, "total_tokens", None))
+
+
 def get_service_island_queues(service_island_id: str) -> list[dict]:
     """Lista as filas da ilha de atendimento ligada ao WhatsApp Channel do
     contato — usada na hora do handoff pra decidir o destino do ticket."""
@@ -50,6 +74,7 @@ def choose_handoff_queue(
     default_queue_id: str | None,
     suggested_queue_name: str | None = None,
     openai_api_key: str | None = None,
+    agent_id: str | None = None,
 ) -> str | None:
     """Decide para qual fila da ilha o ticket de handoff deve ir, dado o motivo
     do transbordo. Cai para a fila padrão do agente (ou a primeira disponível)
@@ -98,6 +123,7 @@ def choose_handoff_queue(
                 {"role": "user", "content": json.dumps({"motivo": reason, "filas": options}, ensure_ascii=False)},
             ],
         )
+        _registrar_uso_openai(agent_id, response)
         content = response.choices[0].message.content or "{}"
         chosen_id = json.loads(content).get("queue_id")
         valid_ids = {q["id"] for q in queues}
@@ -107,7 +133,7 @@ def choose_handoff_queue(
         return fallback
 
 
-def generate_free_error_message(agent_name: str, openai_api_key: str | None = None) -> str:
+def generate_free_error_message(agent_name: str, openai_api_key: str | None = None, agent_id: str | None = None) -> str:
     """Usada quando a Mensagem de erro está DESATIVADA na config do agente —
     "a IA pode gerar qualquer resposta" nesse cenário."""
     try:
@@ -127,6 +153,7 @@ def generate_free_error_message(agent_name: str, openai_api_key: str | None = No
                 },
             ],
         )
+        _registrar_uso_openai(agent_id, response)
         text = (response.choices[0].message.content or "").strip()
         return text or "Desculpe, tivemos um problema para responder agora. Tente novamente em instantes."
     except Exception as e:
@@ -134,7 +161,7 @@ def generate_free_error_message(agent_name: str, openai_api_key: str | None = No
         return "Desculpe, tivemos um problema para responder agora. Tente novamente em instantes."
 
 
-def gerar_resumo_conversa(transcricao: str, openai_api_key: str | None = None) -> str | None:
+def gerar_resumo_conversa(transcricao: str, openai_api_key: str | None = None, agent_id: str | None = None) -> str | None:
     """Resumo curto de como foi a conversa, pro comentário do card no Kanban
     (função KANBAN_CARD). None se falhar — o comentário sai só com os dados."""
     try:
@@ -157,6 +184,7 @@ def gerar_resumo_conversa(transcricao: str, openai_api_key: str | None = None) -
                 {"role": "user", "content": transcricao},
             ],
         )
+        _registrar_uso_openai(agent_id, response)
         return (response.choices[0].message.content or "").strip() or None
     except Exception as e:
         print(f"[julia] Falha ao gerar resumo da conversa pro card: {e}")

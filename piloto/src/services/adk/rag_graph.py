@@ -2,7 +2,8 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from src.infra.pgvector.connection import get_vector_store
+from src.infra.agent_api.client import registrar_tokens
+from src.infra.pgvector.connection import contar_tokens_embedding, get_vector_store
 
 
 class RagState(TypedDict):
@@ -20,6 +21,7 @@ def _retrieve(state: RagState) -> dict:
         k=4, # quantidade de topicos que vai puxar do rag
         filter={"agent_id": state["agent_id"]},
     )
+    registrar_tokens(state["agent_id"], "OPENAI", contar_tokens_embedding([state["pergunta"]]))
     return {"trechos": [doc.page_content for doc in resultados]}
 
 

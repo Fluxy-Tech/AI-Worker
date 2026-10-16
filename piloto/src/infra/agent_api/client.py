@@ -32,18 +32,22 @@ def _get_openai_client(api_key: str | None = None) -> OpenAI:
     return _openai_clients[key]
 
 
-def registrar_tokens(agent_id: str | None, origem: str, quantidade: int | None) -> None:
+def registrar_tokens(agent_id: str | None, origem: str, entrada: int | None, saida: int | None = 0) -> None:
     """Grava o consumo de tokens de uma chamada de LLM feita em nome do agente
     (origem "ADK" = geração via Google ADK/Gemini, "OPENAI" = chamadas diretas
     à OpenAI e embeddings do RAG) — alimenta as métricas de consumo da tela de
-    Agentes do Agent Console. Best-effort: uma falha aqui nunca pode derrubar
-    a conversa."""
+    Agentes do Agent Console, separadas em tokens de entrada (prompt) e de
+    saída (resposta). Best-effort: uma falha aqui nunca pode derrubar a
+    conversa."""
+    entrada = int(entrada or 0)
+    saida = int(saida or 0)
+    quantidade = entrada + saida
     if not agent_id or not quantidade:
         return
     try:
         httpx.post(
             f"{BASE_URL}/internal/agents/{agent_id}/tokens",
-            json={"origin": origem, "quantity": int(quantidade)},
+            json={"origin": origem, "quantity": quantidade, "inputQuantity": entrada, "outputQuantity": saida},
             headers={"x-internal-api-key": INTERNAL_API_KEY},
             timeout=10,
         )
@@ -53,7 +57,12 @@ def registrar_tokens(agent_id: str | None, origem: str, quantidade: int | None) 
 
 def _registrar_uso_openai(agent_id: str | None, response) -> None:
     usage = getattr(response, "usage", None)
-    registrar_tokens(agent_id, "OPENAI", getattr(usage, "total_tokens", None))
+    registrar_tokens(
+        agent_id,
+        "OPENAI",
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+    )
 
 
 def get_service_island_queues(service_island_id: str) -> list[dict]:

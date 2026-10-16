@@ -21,6 +21,7 @@ from src.infra.agent_api.client import (
     resetar_metadados_contato,
     sincronizar_metadados_contato,
 )
+from src.services.adk.funcionalidades import FERRAMENTAS_DE_ENVIO
 from src.services.adk.agent import LABELS_METADATA, build_agent, campos_metadados, funcoes_ativas
 
 
@@ -117,8 +118,16 @@ def _executar_funcao_card(
 
 
 class ResultadoResposta:
-    def __init__(self, texto: str, handoff_requested: bool, handoff_reason: str | None, handoff_suggested_queue: str | None = None):
+    def __init__(
+        self,
+        texto: str,
+        handoff_requested: bool,
+        handoff_reason: str | None,
+        handoff_suggested_queue: str | None = None,
+        envios: list[dict] | None = None,
+    ):
         self.texto = texto
+        self.envios = envios or [] # Mensagens especiais pedidas pelas ferramentas neste turno (ver funcionalidades.py)
         self.handoff_requested = handoff_requested # Serve para direcionar para atendimento, pode vir true ou false
         self.handoff_reason = handoff_reason # Motivo de direcionamento
         self.handoff_suggested_queue = handoff_suggested_queue # Fila de sugestão
@@ -179,15 +188,29 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
         # Soma do consumo de todas as chamadas ao Gemini do turno (o ADK pode
         # chamar o modelo mais de uma vez quando há tool calls) — vira uma
         # linha de Token (origem ADK) só, no fim do turno.
-        tokens_adk = 0
+        tokens_entrada_adk = 0
+        tokens_saida_adk = 0
+        # Envios das funcionalidades de mensagem (catálogo, botões, listas...)
+        # pedidos NESTE turno — lidos das respostas das ferramentas nos
+        # eventos (e não do state) pra não grudarem na sessão e reenviarem.
+        envios: list[dict] = []
 
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=mensagem):
             if event.usage_metadata and event.usage_metadata.total_token_count:
-                tokens_adk += event.usage_metadata.total_token_count
+                # Saída = total - prompt: inclui a resposta e o raciocínio
+                # (thoughts) do Gemini, que também são cobrados como saída.
+                entrada = event.usage_metadata.prompt_token_count or 0
+                tokens_entrada_adk += entrada
+                tokens_saida_adk += event.usage_metadata.total_token_count - entrada
             calls = event.get_function_calls() if hasattr(event, "get_function_calls") else []
             if calls:
                 nomes = [c.name for c in calls]
                 print(f"[session={session_id} user={user_id}] tool call: {nomes}")
+
+            for resposta in event.get_function_responses() or []:
+                dados = resposta.response or {}
+                if resposta.name in FERRAMENTAS_DE_ENVIO and dados.get("ok") and dados.get("envio"):
+                    envios.append(dados["envio"])
             if event.is_final_response() and event.content and event.content.parts:
                 resposta_final = event.content.parts[0].text or resposta_final
 
@@ -196,8 +219,11 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             f"resposta_final='{resposta_final[:200]}'"
         )
 
-        print(f"[session={session_id} user={user_id}] tokens ADK no turno: {tokens_adk}")
-        registrar_tokens(agent_config.get("id"), "ADK", tokens_adk)
+        print(
+            f"[session={session_id} user={user_id}] tokens ADK no turno: "
+            f"entrada={tokens_entrada_adk} saída={tokens_saida_adk}"
+        )
+        registrar_tokens(agent_config.get("id"), "ADK", tokens_entrada_adk, tokens_saida_adk)
 
         sessao_final = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
 
@@ -269,6 +295,7 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
             handoff_requested=handoff_requested,
             handoff_reason=handoff_reason,
             handoff_suggested_queue=handoff_suggested_queue,
+            envios=envios,
         )
 
 

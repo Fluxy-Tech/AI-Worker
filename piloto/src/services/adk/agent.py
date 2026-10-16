@@ -11,6 +11,7 @@ from src.services.adk.infos import (
     GOOGLE_ADK_MODEL,
     STATE_METADADOS_ADICIONAIS,
 )
+from src.services.adk import funcionalidades
 from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
     atualizar_empresa_cliente,
@@ -35,6 +36,10 @@ from src.services.adk.tools import (
 # - funcoes_block: funções fixas ligadas no card "Funções" do Console (hoje
 #   só o agendamento tem instrução — o card do Kanban roda no runner)
 # - rag_block: uso da base de conhecimento (só com ragEnabled)
+# - funcionalidades_block: funcionalidades de mensagem adicionadas no Console
+#   (catálogo, botões, listas, carrosséis...) — ver funcionalidades.py
+# - rgbs_block: quebra da resposta em várias mensagens com [QB] (só com RGBS
+#   ligado — o consumer faz o split e envia uma por vez)
 BASE_INSTRUCTION = """
 Você é {nome}, atendendo via WhatsApp.
 Responda de forma natural, clara e objetiva, sempre em português. Faça uma
@@ -57,6 +62,10 @@ conhecimento.
 {funcoes_block}
 
 {rag_block}
+
+{funcionalidades_block}
+
+{rgbs_block}
 
 ## Ferramentas disponíveis
 
@@ -95,6 +104,25 @@ PERSONALITY_VAZIA = (
     "serviços, preços ou informações da empresa; se o contato perguntar, "
     "ofereça atendimento humano."
 )
+
+# RGBS (Receives, Generates, Breaks and Sends) ligado no Agent Console — o
+# marcador precisa bater com RGBS_MARKER do consumer, que faz o split.
+RGBS_INSTRUCTION = """
+## Formato da resposta: mensagens separadas
+
+Escreva a resposta como uma sequência de mensagens curtas de WhatsApp, como
+uma pessoa digitando. Separe cada mensagem com o marcador [QB] (exatamente
+assim: maiúsculas, entre colchetes). Cada trecho entre marcadores é enviado
+como uma mensagem separada.
+
+- Quebre por ideia: cumprimento, informação, pergunta.
+- Use de 1 a 4 mensagens por resposta; uma resposta curta pode ser uma
+  mensagem só, sem marcador.
+- Nunca coloque [QB] no começo ou no fim da resposta, nem dois seguidos.
+- Nunca quebre no meio de uma frase, de uma lista ou de um link.
+
+Exemplo: Oi, Maria! Tudo bem?[QB]Consigo te ajudar com isso, sim.[QB]Qual o melhor horário pra você?
+"""
 
 RAG_INSTRUCTION = """
 Você tem uma base de conhecimento anexada. Sempre que a pergunta do cliente
@@ -393,6 +421,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     dados_conhecidos_block = _build_known_data_block(target_info, campos)
     personality_block = PERSONALITY_INSTRUCTION.format(personality=personality or PERSONALITY_VAZIA)
     rag_block = RAG_INSTRUCTION if rag_enabled else ""
+    rgbs_block = RGBS_INSTRUCTION if (agent_info.get("rgbs") or {}).get("enabled") else ""
     funcoes = funcoes_ativas(agent_info)
     evento = funcoes.get(FUNCAO_EVENTO)
     if agent_info.get("handoffAfterFunctions"):
@@ -413,6 +442,8 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         dados_conhecidos_block=dados_conhecidos_block,
         personality_block=personality_block,
         rag_block=rag_block,
+        funcionalidades_block=funcionalidades.build_funcionalidades_block(agent_info),
+        rgbs_block=rgbs_block,
     )
 
     tools = [
@@ -433,6 +464,8 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
 
     if evento:
         tools.extend([agendar_evento, consultar_eventos_calendario])
+
+    tools.extend(funcionalidades.build_tools(agent_info, target_info))
 
     return Agent(
         # Nome interno do ADK — fixo, não é o nome de exibição do agente (que

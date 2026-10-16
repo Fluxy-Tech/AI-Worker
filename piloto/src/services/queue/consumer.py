@@ -26,6 +26,8 @@ agrupado/debounced por sessão em janelas de 10s):
     "metadataFields": [{"name", "nameToAgent", "rule"}],  # só os ativos — coletados via registrar_metadado
     "functions": [{"type", "runAtStart", "runAfterMetadata"}],  # CALENDAR_EVENT / KANBAN_CARD
     "handoffAfterFunctions",        # fim do roteiro: true = atendimento humano, false = encerrar
+    "rgbs": {"enabled", "timeSmall", "timeMedium", "timeLarge"},  # quebra em [QB] + espera por tamanho
+    "features": [{"id", "type", "name", "prompt", "config", "products"?}],  # funcionalidades de mensagem (funcionalidades.py)
   },
   "messagingSession": {"id", "startedAt"},
   "messages": [{"mongoMessageId", "externalMessageId", "type", "text", "timestamp"}, ...]
@@ -39,9 +41,11 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 
 from main import gerar_resposta, resetar_jornada
+from src.services.adk.funcionalidades import montar_itens, numerar_mensagens
 from src.infra.agent_api.client import (
     choose_handoff_queue,
     generate_free_error_message,
@@ -145,6 +149,81 @@ def _handle_generation_error(channel, payload: dict, agent: dict, error: Excepti
     _log_message_stage(payload, "end")
 
 
+# RGBS (Receives, Generates, Breaks and Sends) — o prompt pede pro agente
+# separar as mensagens com este marcador (ver RGBS_INSTRUCTION em agent.py).
+RGBS_MARKER = "[QB]"
+# Limites de tamanho (caracteres) e tempos mínimos (segundos) de cada faixa —
+# os mesmos validados no Agent-Api; repetidos aqui pra nunca enviar mais
+# rápido que o mínimo, mesmo com payload antigo/incompleto.
+RGBS_SMALL_MAX_CHARS = 40
+RGBS_MEDIUM_MAX_CHARS = 100
+RGBS_MIN_SECONDS = {"timeSmall": 5, "timeMedium": 10, "timeLarge": 15}
+
+
+def _split_rgbs(texto: str) -> list[str]:
+    return [parte.strip() for parte in texto.split(RGBS_MARKER) if parte.strip()]
+
+
+def _rgbs_delay(parte: str, rgbs: dict) -> int:
+    """Espera antes de enviar a parte, pela faixa de tamanho dela: até 40
+    caracteres = timeSmall, até 100 = timeMedium, acima disso = timeLarge."""
+    if len(parte) <= RGBS_SMALL_MAX_CHARS:
+        chave = "timeSmall"
+    elif len(parte) <= RGBS_MEDIUM_MAX_CHARS:
+        chave = "timeMedium"
+    else:
+        chave = "timeLarge"
+    minimo = RGBS_MIN_SECONDS[chave]
+    try:
+        return max(int(rgbs.get(chave) or minimo), minimo)
+    except (TypeError, ValueError):
+        return minimo
+
+
+def _outbound_item(payload: dict, item: dict, finishes: bool) -> dict:
+    """item = {"text"} (mensagem normal) ou {"text", "interactive"} (catálogo:
+    o text é o resumo que fica no histórico)."""
+    outbound = _base_outbound_payload(payload)
+    outbound["answer"] = {"text": item["text"], "audio": "", "image": ""}
+    if item.get("interactive"):
+        outbound["interactive"] = item["interactive"]
+    if item.get("contextMessageId"):
+        outbound["contextMessageId"] = item["contextMessageId"]
+    if item.get("previewUrl"):
+        outbound["previewUrl"] = True
+    outbound["finishesProcessing"] = finishes
+    return outbound
+
+
+def _send_rgbs_parts(channel, payload: dict, itens: list[dict], rgbs: dict) -> None:
+    """Envia cada parte como uma mensagem, esperando antes de cada uma o tempo
+    da faixa de tamanho dela. Roda numa thread pra não segurar o consumo da
+    fila (prefetch=1: dormir aqui travaria as conversas dos outros contatos)
+    — o publish volta pra thread do pika via add_callback_threadsafe, porque
+    o channel não é thread-safe. Só a última parte libera a sessão
+    (finishesProcessing), então o contato não abre outro turno no meio."""
+    connection = channel.connection
+
+    def publicar(outbound: dict) -> None:
+        try:
+            publish_outbound_message(channel, outbound)
+        except Exception as e:
+            _log(payload, f"RGBS: falha ao publicar parte: {e}")
+
+    def enviar() -> None:
+        for i, item in enumerate(itens):
+            # Catálogo conta como mensagem pequena — o resumo do histórico
+            # não é o que o contato lê.
+            espera = _rgbs_delay("" if item.get("interactive") else item["text"], rgbs)
+            _log(payload, f"RGBS: parte {i + 1}/{len(itens)} ({len(item['text'])} chars) em {espera}s")
+            time.sleep(espera)
+            outbound = _outbound_item(payload, item, finishes=i == len(itens) - 1)
+            connection.add_callback_threadsafe(lambda o=outbound: publicar(o))
+        _log_message_stage(payload, "end")
+
+    threading.Thread(target=enviar, daemon=True).start()
+
+
 def _is_reset_keyword(pergunta: str, whatsapp_channel: dict) -> bool:
     """Determinístico, roda ANTES do LLM — a mensagem do contato precisa
     bater EXATAMENTE (normalizada, sem acento/maiúscula/pontuação) com uma
@@ -240,8 +319,12 @@ def _on_message(channel, method, properties, body):
 
         _log(payload, f"pergunta='{pergunta[:200]}' -> chamando ADK")
 
+        # Com respostas contextuais ligadas, cada mensagem vai numerada pro
+        # agente poder citar uma delas (o reset acima usa o texto cru).
+        pergunta_agente = numerar_mensagens(agent, [m.get("text", "") for m in messages])
+
         try:
-            resultado = gerar_resposta(pergunta, target, agent, session=messaging_session) # Chama gerador de resposta
+            resultado = gerar_resposta(pergunta_agente, target, agent, session=messaging_session) # Chama gerador de resposta
         except Exception as e:
             _log(payload, f"ADK falhou: {e}")
             print(traceback.format_exc())
@@ -262,10 +345,33 @@ def _on_message(channel, method, properties, body):
             _log(payload, "ACK (handoff)")
             return
 
-        outbound = _base_outbound_payload(payload)
-        outbound["answer"] = {"text": resultado.texto or "", "audio": "", "image": ""}
-        outbound["finishesProcessing"] = True
-        publish_outbound_message(channel, outbound)
+        texto = resultado.texto or ""
+        rgbs = agent.get("rgbs") or {}
+        partes = _split_rgbs(texto)
+
+        if not rgbs.get("enabled"):
+            # RGBS desligado: se o modelo ainda assim mandar o marcador, ele não
+            # pode chegar cru no WhatsApp — vira quebra de parágrafo.
+            partes = ["\n\n".join(partes)] if partes else []
+
+        # Texto da resposta + envios das funcionalidades (catálogo, botões,
+        # listas...), na ordem em que saem — ver funcionalidades.montar_itens.
+        ids_mensagens = [m.get("externalMessageId") for m in messages]
+        itens = montar_itens(agent, partes, resultado.envios, ids_mensagens)
+        for item in itens:
+            if item.get("interactive"):
+                _log(payload, f"envio interativo: {item['interactive'].get('type')}")
+
+        if rgbs.get("enabled") and itens:
+            _send_rgbs_parts(channel, payload, itens, rgbs)
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            _log(payload, f"ACK (RGBS: {len(itens)} parte(s) agendadas para outbound.message.send)")
+            return
+
+        # Sem nada pra enviar, ainda publica (vazio) pra liberar a sessão.
+        itens = itens or [{"text": ""}]
+        for i, item in enumerate(itens):
+            publish_outbound_message(channel, _outbound_item(payload, item, finishes=i == len(itens) - 1))
         _log_message_stage(payload, "end")
 
         channel.basic_ack(delivery_tag=method.delivery_tag)

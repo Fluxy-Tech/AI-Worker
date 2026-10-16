@@ -145,6 +145,28 @@ ferramentas abaixo. Use cada funcionalidade só na situação descrita em
   resposta seja o texto da mensagem (recomendado).
 - Não repita por escrito o que já vai no envio (produtos, opções, links).
 - No máximo um envio de cada funcionalidade por resposta.
+- Resposta com envio de funcionalidade = resposta sem coleta de dados. Na
+  mesma resposta em que chamar uma ferramenta de envio (enviar_*,
+  solicitar_localizacao ou enviar_cobranca), NÃO faça nenhuma pergunta da
+  "Coleta de dados obrigatória" nem dos dados adicionais: nem no seu texto,
+  nem no parâmetro texto da ferramenta. Essa resposta fala só do envio.
+  Retome a coleta na próxima resposta que for só texto livre, sem
+  funcionalidade.
+"""
+
+
+def tem_envio(agent_info: dict) -> bool:
+    """Há alguma funcionalidade que envia mensagem especial (respostas
+    contextuais só citam a mensagem, não contam)."""
+    return any(f.get("type") != CONTEXTUAL_REPLY for f in listar(agent_info))
+
+
+# Anexada à "Coleta de dados obrigatória" quando o agente tem funcionalidades
+# de envio — sem isso as duas instruções brigam (a coleta manda perguntar).
+COLETA_SEM_FUNCIONALIDADE = """
+Faça as perguntas desta coleta só em respostas de texto livre. Nunca pergunte
+nenhum destes dados na mesma resposta em que enviar uma funcionalidade de
+mensagem (ver "Funcionalidades de mensagem"): deixe para a próxima resposta.
 """
 
 

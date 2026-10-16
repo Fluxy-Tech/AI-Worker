@@ -432,6 +432,8 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         metadados_adicionais_block=_build_metadados_adicionais_block(campos),
         encerramento=encerramento,
     )
+    if funcionalidades.tem_envio(agent_info):
+        coleta_dados_block += funcionalidades.COLETA_SEM_FUNCIONALIDADE
 
     instruction = BASE_INSTRUCTION.format(
         nome=nome,

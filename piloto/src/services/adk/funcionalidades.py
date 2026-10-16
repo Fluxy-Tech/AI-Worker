@@ -12,8 +12,8 @@ Para cada tipo presente este módulo monta:
 - o objeto `interactive` (ou texto) que o Outbound-Worker manda pra Meta.
 
 Tipos: CATALOG, PRODUCT_CAROUSEL, CTA_URL, LIST, REPLY_BUTTONS,
-MEDIA_CAROUSEL, LOCATION_REQUEST, CONTEXTUAL_REPLY, LINK_PREVIEW e PAYMENT
-(este só backend, sem tela no Console).
+MEDIA_CAROUSEL, LOCATION_REQUEST, CONTEXTUAL_REPLY, LINK_PREVIEW, FLOW e
+PAYMENT (este só backend, sem tela no Console).
 """
 
 import re
@@ -31,6 +31,7 @@ LOCATION_REQUEST = "LOCATION_REQUEST"
 CONTEXTUAL_REPLY = "CONTEXTUAL_REPLY"
 LINK_PREVIEW = "LINK_PREVIEW"
 PAYMENT = "PAYMENT"
+FLOW = "FLOW"
 
 # Limites da Meta.
 MAX_BODY = 1024
@@ -42,11 +43,12 @@ MAX_CARD_BODY = 160
 MAX_PRODUTOS_LISTA = 30
 MIN_CARDS, MAX_CARDS = 2, 10
 MAX_BOTOES_RESPOSTA = 3
+MAX_BOTAO_FLOW = 30
 
 # Tipos em que o texto da mensagem é o corpo do próprio envio: com o texto da
 # ferramenta vazio, a resposta do agente vira esse corpo (em vez de sair
 # como mensagem separada antes).
-TIPOS_COM_CORPO = {CTA_URL, LIST, REPLY_BUTTONS, LOCATION_REQUEST, LINK_PREVIEW, PAYMENT}
+TIPOS_COM_CORPO = {CTA_URL, LIST, REPLY_BUTTONS, LOCATION_REQUEST, LINK_PREVIEW, PAYMENT, FLOW}
 
 TEXTO_PADRAO = {
     CATALOG: "Confira nosso catálogo:",
@@ -57,6 +59,7 @@ TEXTO_PADRAO = {
     REPLY_BUTTONS: "Escolha uma opção:",
     LOCATION_REQUEST: "Pode me enviar a sua localização? Toque no botão abaixo.",
     PAYMENT: "Segue a cobrança:",
+    FLOW: "Preencha pelo botão abaixo:",
 }
 
 ROTULO = {
@@ -70,6 +73,7 @@ ROTULO = {
     CONTEXTUAL_REPLY: "Respostas contextuais",
     LINK_PREVIEW: "Prévia de link",
     PAYMENT: "Cobrança",
+    FLOW: "Formulário (Flow)",
 }
 
 FERRAMENTA = {
@@ -83,6 +87,7 @@ FERRAMENTA = {
     CONTEXTUAL_REPLY: "responder_em_contexto",
     LINK_PREVIEW: "enviar_previa_link",
     PAYMENT: "enviar_cobranca",
+    FLOW: "enviar_flow",
 }
 FERRAMENTAS_DE_ENVIO = set(FERRAMENTA.values())
 
@@ -141,7 +146,7 @@ ferramentas abaixo. Use cada funcionalidade só na situação descrita em
 "Quando usar" (definida pela empresa) e informe sempre o id dela.
 
 - Parâmetro texto: frase que acompanha o envio. Em botões, listas,
-  localização, prévia de link e cobrança, deixe vazio para que a sua própria
+  localização, prévia de link, formulário e cobrança, deixe vazio para que a sua própria
   resposta seja o texto da mensagem (recomendado).
 - Não repita por escrito o que já vai no envio (produtos, opções, links).
 - No máximo um envio de cada funcionalidade por resposta.
@@ -229,6 +234,14 @@ def _detalhes(funcionalidade: dict) -> list[str]:
             "mensagem específica entre várias, chame responder_em_contexto "
             "com o número dela: sua resposta sai citando essa mensagem."
         )
+    elif tipo == FLOW:
+        linhas.append(f'Abre o formulário "{config.get("flowName")}" pelo botão "{config.get("ctaText")}".')
+        if config.get("saveAsMetadata"):
+            linhas.append(
+                "As respostas do formulário são salvas automaticamente nos metadados do contato: "
+                "não pergunte de novo o que ele já preencheu."
+            )
+        linhas.append("Quando o contato enviar, as respostas chegam como mensagem dele.")
     elif tipo == PAYMENT:
         metodos = ", ".join(config.get("methods") or [])
         linhas.append(f"Métodos aceitos: {metodos}. Informe o valor total em centavos (ex: R$ 12,34 = 1234).")
@@ -429,6 +442,22 @@ def build_tools(agent_info: dict, target_info: dict | None = None) -> list:
 
         tools.append(enviar_previa_link)
 
+    if FLOW in tipos:
+
+        def enviar_flow(funcionalidade_id: str, texto: str) -> dict:
+            """Envia um formulário do WhatsApp (Flow), aberto por um botão na mensagem.
+
+            Args:
+                funcionalidade_id: id da funcionalidade de formulário.
+                texto: texto da mensagem; vazio = usa a sua resposta.
+            """
+            f = _por_id(agent_info, funcionalidade_id, FLOW)
+            if not f:
+                return _erro(f"Funcionalidade não encontrada. Ids: {_ids_disponiveis(agent_info, FLOW)}")
+            return _ok({"tipo": FLOW, "id": f["id"], "texto": texto or ""})
+
+        tools.append(enviar_flow)
+
     if CONTEXTUAL_REPLY in tipos:
 
         def responder_em_contexto(numero_mensagem: int) -> dict:
@@ -628,6 +657,33 @@ def _interactive_localizacao(f: dict, texto: str) -> tuple[dict, str]:
     )
 
 
+def _interactive_flow(f: dict, texto: str) -> tuple[dict, str]:
+    """Flow: flow_token leva o id da funcionalidade, pro Inbound-Service saber
+    se salva as respostas como metadados. Rascunho sai em modo draft."""
+    config = _config(f)
+    parametros: dict = {
+        "flow_message_version": "3",
+        "flow_token": f"sturnus:{f['id']}:{uuid.uuid4().hex[:12]}",
+        "flow_id": config["flowId"],
+        "flow_cta": _cortar(config["ctaText"], MAX_BOTAO_FLOW),
+        "flow_action": "navigate",
+    }
+    if config.get("firstScreen"):
+        parametros["flow_action_payload"] = {"screen": config["firstScreen"]}
+    if config.get("status") == "DRAFT":
+        parametros["mode"] = "draft"
+    interactive: dict = {
+        "type": "flow",
+        "body": {"text": _cortar(texto or config.get("bodyText") or TEXTO_PADRAO[FLOW], MAX_BODY)},
+        "action": {"name": "flow", "parameters": parametros},
+    }
+    if config.get("headerText"):
+        interactive["header"] = {"type": "text", "text": _cortar(config["headerText"], MAX_HEADER)}
+    if config.get("footerText"):
+        interactive["footer"] = {"text": _cortar(config["footerText"], MAX_FOOTER)}
+    return interactive, f"{interactive['body']['text']}\n📝 [{config['ctaText']}] {config.get('flowName') or 'Formulário'}"
+
+
 def montar_order_details(
     config: dict,
     metodo: str,
@@ -731,6 +787,8 @@ def montar_itens(agent_info: dict, partes_texto: list[str], envios: list[dict], 
             interactive, resumo = _interactive_botoes(envio, texto)
         elif tipo == LOCATION_REQUEST:
             interactive, resumo = _interactive_localizacao(f, texto)
+        elif tipo == FLOW:
+            interactive, resumo = _interactive_flow(f, texto)
         elif tipo == LINK_PREVIEW:
             url = _config(f)["url"]
             corpo = f"{texto}\n\n{url}" if texto else url

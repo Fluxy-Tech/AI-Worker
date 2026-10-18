@@ -1,29 +1,15 @@
 import os
 
-# Metadados que a IA pode armazenar (sincronizados em Target.metadata ao fim
-# de cada turno — ver runner.py). Roteiro de prospecção de leads:
-#   nome                      -> nome da pessoa
-#   nome_empresa              -> nome da empresa
-#   volumetria_atendimento    -> 1 (baixa) a 10 (muito alta)
-#   ja_usou_sistema_whatsapp  -> "Sim"/"Não" (+ qual sistema, se informar)
-#   data_horario_contato      -> data/hora que o lead pode conversar (dd/mm/aaaa hh:mm)
-CHAVES_METADATA = (
-    "nome",
-    "nome_empresa",
-    "volumetria_atendimento",
-    "ja_usou_sistema_whatsapp",
-    "data_horario_contato",
-)
+# Metadados que o próprio worker grava (sincronizados em Target.metadata ao
+# fim de cada turno — ver runner.py). Não há coleta fixa: o que o agente
+# pergunta ao contato vem só dos metadados criados no Agent Console
+# (agent.metadataFields). Fica aqui só o que é preenchido por uma função:
+#   data_horario_contato -> data/hora do evento agendado (dd/mm/aaaa hh:mm)
+CHAVES_METADATA = ("data_horario_contato",)
 
-# Roteiro fixo de coleta — define quando "todos os metadados foram
-# coletados" (junto com os metadados ativos do Agent Console).
-# data_horario_contato fica de fora: é preenchido pela função de agendamento.
-CHAVES_COLETA_FIXA = (
-    "nome",
-    "nome_empresa",
-    "volumetria_atendimento",
-    "ja_usou_sistema_whatsapp",
-)
+# Chaves que um metadado do Agent Console não pode usar — já têm dono
+# (CHAVES_METADATA) ou são controle interno do runner.
+CHAVES_RESERVADAS = CHAVES_METADATA + ("contato_iniciado",)
 
 # Funções fixas ligadas no card "Funções" do Agent Console (payload
 # agent.functions: [{type, runAtStart, runAfterMetadata}]).
@@ -32,7 +18,8 @@ FUNCAO_CARD = "KANBAN_CARD"
 
 # Chave do state da sessão onde a tool registrar_metadado guarda os metadados
 # configurados no Agent Console ({nameToAgent: valor}) — o runner mescla em
-# Target.metadata junto com CHAVES_METADATA.
+# Target.metadata junto com CHAVES_METADATA. Também é a fonte dos dados do
+# lead no evento do calendário (ver tools.descricao_lead).
 STATE_METADADOS_ADICIONAIS = "metadados_adicionais"
 
 # Nome do agente

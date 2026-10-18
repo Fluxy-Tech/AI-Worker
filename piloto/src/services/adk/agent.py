@@ -7,6 +7,7 @@ from google.adk.tools import ToolContext
 from src.services.adk.infos import (
     AGENT_TIMEZONE,
     CHAVES_METADATA,
+    CHAVES_RESERVADAS,
     FUNCAO_EVENTO,
     GOOGLE_ADK_MODEL,
     STATE_METADADOS_ADICIONAIS,
@@ -14,10 +15,6 @@ from src.services.adk.infos import (
 from src.services.adk import funcionalidades
 from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
-    atualizar_empresa_cliente,
-    atualizar_nome_cliente,
-    atualizar_uso_sistema_whatsapp,
-    atualizar_volumetria_atendimento,
     agendar_evento,
     consultar_eventos_calendario,
     encerrar_conversa,
@@ -25,85 +22,24 @@ from src.services.adk.tools import (
     solicitar_atendimento_humano,
 )
 
-# Blocos montados em build_agent:
-# - data_atual_block: data/hora atual — base pra converter "amanhã às 14h" em data
-# - personality_block: instruções do Agent Console (empresa, o que pode falar,
-#   personalidade) — é o que muda de um agente pro outro
-# - dados_conhecidos_block: dados já salvos no metadata do contato (vem antes
-#   do fluxo/coleta, que se referem a ele como "acima")
-# - fluxo_block: primeiro contato ou conversa com histórico (ver _tem_historico)
-# - coleta_dados_block: roteiro fixo de coleta de dados do contato
-# - funcoes_block: funções fixas ligadas no card "Funções" do Console (hoje
-#   só o agendamento tem instrução — o card do Kanban roda no runner)
+# O prompt é só a Identidade do Agent Console (nome + personalidade) e os
+# blocos das funções ligadas no agente — nenhum texto fixo além disso. Cada
+# bloco abaixo entra só com a sua condição (vazio = fica de fora):
+# - identidade: "Você é {nome}." + personalidade (sempre)
+# - dados_conhecidos_block: metadados já salvos do contato (só com metadados)
+# - coleta_dados_block: coleta dos metadados criados no card "Metadados" do
+#   Console + como encerrar (só com metadados e/ou agendamento)
+# - data_atual_block + funcoes_block: agendamento (só com CALENDAR_EVENT — a
+#   data é a base pra converter "amanhã às 14h"; o card do Kanban roda no
+#   runner, sem instrução)
 # - rag_block: uso da base de conhecimento (só com ragEnabled)
-# - funcionalidades_block: funcionalidades de mensagem adicionadas no Console
+# - funcionalidades_block: funcionalidades de mensagem cadastradas no Console
 #   (catálogo, botões, listas, carrosséis...) — ver funcionalidades.py
 # - rgbs_block: quebra da resposta em várias mensagens com [QB] (só com RGBS
 #   ligado — o consumer faz o split e envia uma por vez)
-BASE_INSTRUCTION = """
-Você é {nome}, atendendo via WhatsApp.
-Responda de forma natural, clara e objetiva, sempre em português. Faça uma
-pergunta por vez quando precisar de mais informação do contato — nunca
-acumule várias perguntas na mesma mensagem. Nunca invente informações que
-você não tenha certeza: sobre a empresa, produtos, serviços e preços, fale
-apenas o que estiver nas instruções do agente abaixo ou na base de
-conhecimento.
-
-{data_atual_block}
-
-{personality_block}
-
-{dados_conhecidos_block}
-
-{fluxo_block}
-
-{coleta_dados_block}
-
-{funcoes_block}
-
-{rag_block}
-
-{funcionalidades_block}
-
-{rgbs_block}
-
-## Ferramentas disponíveis
-
-- atualizar_nome_cliente / atualizar_empresa_cliente /
-  atualizar_volumetria_atendimento / atualizar_uso_sistema_whatsapp: chame
-  cada uma assim que o contato informar ou confirmar o dado correspondente
-  (não precisa perguntar de novo o que já estiver na seção "Dados já
-  registrados" acima).
-- solicitar_atendimento_humano: chame sempre que o contato pedir
-  explicitamente para falar com uma pessoa, ou quando a dúvida estiver fora
-  do que você consegue resolver com segurança. Se você já souber a fila
-  certa, preencha o parâmetro fila_sugerida com o nome dela.
-- encerrar_conversa: chame quando o contato se despedir, confirmar que não
-  precisa de mais nada, ou logo depois de encaminhar o atendimento humano.
-- parar_envio_campanhas: chame assim que o contato pedir explicitamente para
-  não receber mais campanhas/mensagens em massa (ex: "não quero mais
-  receber", "pare de me mandar mensagem", "me remova da lista").
-"""
-
-# Campo "personality" do Agent Console — texto livre onde a empresa define
-# quem o agente representa, o que pode/não pode falar e o tom. O roteiro de
-# coleta de dados e as ferramentas continuam fixos, fora do controle dele.
-PERSONALITY_INSTRUCTION = """
-## Instruções do agente
-
-As instruções abaixo foram definidas pela empresa que você representa:
-informações da empresa, o que você pode e o que não pode falar, e como deve
-se comunicar. Siga-as em tudo, exceto no roteiro de coleta de dados e no uso
-das ferramentas, que são obrigatórios.
-
-{personality}
-"""
-
-PERSONALITY_VAZIA = (
-    "Nenhuma instrução específica foi configurada. Não fale sobre produtos, "
-    "serviços, preços ou informações da empresa; se o contato perguntar, "
-    "ofereça atendimento humano."
-)
+# As ferramentas padrão (atendimento humano, encerrar, parar campanhas) não
+# têm texto no prompt: o modelo as conhece pelas docstrings em tools.py.
+IDENTIDADE_INSTRUCTION = "Você é {nome}."
 
 # RGBS (Receives, Generates, Breaks and Sends) ligado no Agent Console — o
 # marcador precisa bater com RGBS_MARKER do consumer, que faz o split.
@@ -132,67 +68,47 @@ não retornar nada relevante, diga isso ao cliente em vez de inventar uma
 resposta.
 """
 
-# Saudação obrigatória — só entra na instrução quando o contato NÃO tem
-# histórico de conversa ainda (ver _tem_historico).
-PRIMEIRO_CONTATO_INSTRUCTION = """
-## Primeiro contato
-
-Este é o PRIMEIRO contato com esta pessoa — não há histórico de conversa
-anterior. Apresente-se de forma breve e cordial, explique que precisa
-confirmar alguns dados rápidos, e comece a coleta de dados descrita abaixo.
-"""
-
-# Conversa normal — quando o contato já tem histórico (ver _tem_historico).
-FLUXO_CONTINUO_INSTRUCTION = """
-## Conversa com histórico
-
-Este contato já falou com você antes — continue de forma fluida e natural,
-sem repetir a apresentação inicial. Siga direto para a coleta de dados
-descrita abaixo, pulando o que já estiver em "Dados já registrados".
-"""
-
-# Roteiro de coleta de dados — sempre presente, independente de já ter
-# histórico ou não. Dirigido pelo bloco "Dados já registrados"
-# (_build_known_data_block), não por qual turno da conversa está.
+# Coleta dos metadados criados no card "Metadados" do Agent Console (só os
+# ativos, via payload agent.metadataFields) — não existe dado fixo: sem
+# metadado cadastrado, esta seção não entra. Dirigida pelo bloco "Dados já
+# registrados" (_build_known_data_block), não por qual turno da conversa está.
 COLETA_DADOS_INSTRUCTION = """
 ## Coleta de dados obrigatória
 
-Confirme estes dados sobre o contato, um de cada vez (pule qualquer um que
-já esteja em "Dados já registrados" acima):
+Colete estes dados do contato, um de cada vez, seguindo a regra de cada um
+(pule qualquer um que já esteja em "Dados já registrados" acima). Assim que o
+contato informar um deles, chame registrar_metadado com a chave exata
+indicada:
 
-1. Nome da pessoa -> atualizar_nome_cliente
-2. Nome da empresa -> atualizar_empresa_cliente
-3. Volumetria de atendimento da empresa, de 1 a 10 (1 = baixa, 10 = muito
-   alta) -> atualizar_volumetria_atendimento
-4. Se já usou algum sistema de gerenciamento de WhatsApp para empresas
-   -> atualizar_uso_sistema_whatsapp
+{itens}
+"""
 
-Assim que o contato informar cada dado, chame a ferramenta correspondente
-imediatamente.
-{metadados_adicionais_block}
+ENCERRAMENTO_INSTRUCTION = """
+## Encerramento
+
 {encerramento}
 """
 
-ENCERRAMENTO_SEM_AGENDAMENTO = """Quando todos os dados estiverem registrados, agradeça, diga que a equipe vai
+# Condição de "terminou" de cada combinação coleta x agendamento — entra no
+# {condicao} dos textos de encerramento abaixo.
+CONDICAO_COLETA = "todos os dados estiverem registrados"
+CONDICAO_COLETA_E_AGENDAMENTO = 'todos os dados estiverem registrados e o evento estiver agendado (ver "Funções" abaixo)'
+CONDICAO_AGENDAMENTO = 'o evento estiver agendado (ver "Funções" abaixo)'
+
+ENCERRAMENTO_SEM_AGENDAMENTO = """Quando {condicao}, agradeça, diga que a equipe vai
 dar continuidade e chame encerrar_conversa. Não continue fazendo perguntas
 depois disso."""
 
-ENCERRAMENTO_COM_AGENDAMENTO = """Quando todos os dados estiverem registrados e o evento estiver agendado (ver
-"Funções" abaixo), confirme com o contato a data e o horário combinados e
-chame encerrar_conversa. Não continue fazendo perguntas depois disso."""
+ENCERRAMENTO_COM_AGENDAMENTO = """Quando {condicao}, confirme com o contato a data e
+o horário combinados e chame encerrar_conversa. Não continue fazendo
+perguntas depois disso."""
 
 # Switch "Enviar para o atendimento humano ao terminar" do card "Funções"
 # (payload agent.handoffAfterFunctions) — troca o encerrar_conversa do fim
 # do roteiro pelo encaminhamento a um atendente.
-ENCERRAMENTO_HANDOFF_SEM_AGENDAMENTO = """Quando todos os dados estiverem registrados, chame
-solicitar_atendimento_humano com o motivo "Coleta de dados concluída" para
-encaminhar o contato a um atendente. Não chame encerrar_conversa e não
-continue fazendo perguntas depois disso."""
-
-ENCERRAMENTO_HANDOFF_COM_AGENDAMENTO = """Quando todos os dados estiverem registrados e o evento estiver agendado (ver
-"Funções" abaixo), chame solicitar_atendimento_humano com o motivo "Coleta
-de dados e agendamento concluídos" para encaminhar o contato a um atendente.
-Não chame encerrar_conversa e não continue fazendo perguntas depois disso."""
+ENCERRAMENTO_HANDOFF = """Quando {condicao}, chame solicitar_atendimento_humano
+com o motivo "{motivo}" para encaminhar o contato a um atendente. Não chame
+encerrar_conversa e não continue fazendo perguntas depois disso."""
 
 # Função CALENDAR_EVENT ligada no Console. O momento vem dos switches
 # runAtStart / runAfterMetadata (os dois podem estar ligados).
@@ -218,24 +134,16 @@ EVENTO_NO_INICIO = """Quando: no início da conversa — logo depois de cumprime
 ANTES da coleta de dados. Só siga para a coleta depois que o evento estiver
 agendado (ou se o contato disser que não quer agendar)."""
 
-EVENTO_APOS_COLETA = """Quando: depois que todos os dados da coleta (inclusive os adicionais)
-estiverem registrados, antes de encerrar a conversa."""
+EVENTO_APOS_COLETA = """Quando: depois que todos os dados da coleta estiverem registrados, antes de
+encerrar a conversa."""
+
+# Agendamento ligado sem nenhum metadado cadastrado: não há coleta para
+# esperar, então o momento "após a coleta" vira "logo no início".
+EVENTO_SEM_COLETA = """Quando: logo depois de cumprimentar/se apresentar, assim que entender o que
+o contato precisa."""
 
 EVENTO_CONFIRMAR_APOS_COLETA = """Depois da coleta, confirme com o contato se o dia e o horário agendados
 continuam bons; se ele quiser mudar, chame agendar_evento de novo."""
-
-# Metadados configurados no card "Metadados" do Agent Console (só os
-# ativos, via payload agent.metadataFields) — entram no mesmo roteiro de
-# coleta, depois dos dados fixos acima.
-METADADOS_ADICIONAIS_INSTRUCTION = """
-Dados adicionais: colete também estes dados, um de cada vez, seguindo a
-regra de cada um (pule os que já estiverem em "Dados já registrados"). Assim
-que o contato informar um deles, chame registrar_metadado com a chave
-exata indicada:
-
-{itens}
-"""
-
 
 """
 ------------------------------------
@@ -245,22 +153,7 @@ Abaixo temos funções de funcionamento padrão de agentes
 ------------------------------------
 """
 
-def _tem_historico(target_info: dict) -> bool: # Checar o metadado para ver se a variavel existe de contato iniciado
-    """Verdadeiro só depois que ESTE contato já trocou pelo menos uma mensagem
-    com o agente antes — marcado de forma determinística pelo runner ao fim de
-    todo turno (metadata.contato_iniciado), não por uma tool que o modelo
-    poderia esquecer de chamar. Note que target_info.name (nome de perfil do
-    WhatsApp) NÃO conta como histórico: ele existe mesmo no primeiro
-    contato."""
-    metadata = target_info.get("metadata") or {}
-    return bool(metadata.get("contato_iniciado"))
-
-
 LABELS_METADATA = {
-    "nome": "Nome",
-    "nome_empresa": "Empresa",
-    "volumetria_atendimento": "Volumetria de atendimento (1-10)",
-    "ja_usou_sistema_whatsapp": "Já usou sistema de gerenciamento de WhatsApp",
     "data_horario_contato": "Data/horário combinado para conversar",
 }
 
@@ -291,11 +184,15 @@ def funcoes_ativas(agent_info: dict) -> dict[str, dict]:
     return ativas
 
 
-def _build_funcao_evento_block(evento: dict | None) -> str:
+def _build_funcao_evento_block(evento: dict | None, tem_coleta: bool) -> str:
     if not evento:
         return ""
     momentos = []
-    if evento["inicio"]:
+    if not tem_coleta:
+        # EVENTO_NO_INICIO fala em "antes da coleta": sem coleta, os dois
+        # momentos viram o mesmo texto.
+        momentos.append(EVENTO_SEM_COLETA)
+    elif evento["inicio"]:
         momentos.append(EVENTO_NO_INICIO)
         if evento["apos_coleta"]:
             momentos.append(EVENTO_CONFIRMAR_APOS_COLETA)
@@ -305,38 +202,57 @@ def _build_funcao_evento_block(evento: dict | None) -> str:
 
 
 def campos_metadados(agent_info: dict) -> list[dict]:
-    """Metadados ativos do Agent Console (payload agent.metadataFields). Chaves
-    que colidem com os dados fixos (CHAVES_METADATA) ficam de fora — esses já
-    têm ferramenta e roteiro próprios."""
+    """Metadados ativos do Agent Console (payload agent.metadataFields) — a
+    única fonte do que o agente coleta. Chaves reservadas (CHAVES_RESERVADAS)
+    ficam de fora: já são gravadas pelo próprio worker."""
     campos = []
     for campo in agent_info.get("metadataFields") or []:
         chave = (campo.get("nameToAgent") or "").strip()
-        if chave and chave not in CHAVES_METADATA:
+        if chave and chave not in CHAVES_RESERVADAS:
             campos.append({"chave": chave, "nome": campo.get("name") or chave, "regra": (campo.get("rule") or "").strip()})
     return campos
 
 
-def _build_metadados_adicionais_block(campos: list[dict]) -> str:
-    if not campos:
-        return ""
-    itens = "\n".join(f"- {c['chave']} ({c['nome']}): {c['regra']}" for c in campos)
-    return METADADOS_ADICIONAIS_INSTRUCTION.format(itens=itens)
+def _build_coleta_dados_block(campos: list[dict], encerramento: str | None, tem_envio: bool) -> str:
+    partes = []
+    if campos:
+        itens = "\n".join(f"- {c['chave']} ({c['nome']}): {c['regra']}" for c in campos)
+        partes.append(COLETA_DADOS_INSTRUCTION.format(itens=itens))
+        if tem_envio:
+            partes.append(funcionalidades.COLETA_SEM_FUNCIONALIDADE)
+    if encerramento:
+        partes.append(ENCERRAMENTO_INSTRUCTION.format(encerramento=encerramento))
+    return "".join(partes)
 
 
-def _build_known_data_block(target_info: dict, campos: list[dict]) -> str: # Função de coletar os metadados e passar para o agente
-    """Dados que já existem no cadastro do contato (nome vindo do perfil do
-    WhatsApp, qualquer um dos CHAVES_METADATA ou dos metadados do Agent
-    Console já registrado em conversa anterior) — evita que o agente pergunte
-    de novo algo que já sabe, mesmo numa sessão nova."""
+def _build_encerramento(tem_coleta: bool, evento: dict | None, handoff: bool) -> str | None:
+    """Como fechar a conversa quando a coleta e/ou o agendamento terminam. Sem
+    nenhum dos dois não há um "fim do roteiro": o agente encerra pelas regras
+    gerais das ferramentas."""
+    if tem_coleta and evento:
+        condicao, motivo = CONDICAO_COLETA_E_AGENDAMENTO, "Coleta de dados e agendamento concluídos"
+    elif tem_coleta:
+        condicao, motivo = CONDICAO_COLETA, "Coleta de dados concluída"
+    elif evento:
+        condicao, motivo = CONDICAO_AGENDAMENTO, "Agendamento concluído"
+    else:
+        return None
+    if handoff:
+        return ENCERRAMENTO_HANDOFF.format(condicao=condicao, motivo=motivo)
+    modelo = ENCERRAMENTO_COM_AGENDAMENTO if evento else ENCERRAMENTO_SEM_AGENDAMENTO
+    return modelo.format(condicao=condicao)
+
+
+def _build_known_data_block(target_info: dict, campos: list[dict], evento: dict | None) -> str: # Função de coletar os metadados e passar para o agente
+    """Dados que já existem no cadastro do contato (metadados do Agent Console
+    já registrados em conversa anterior e, com o agendamento ligado, o
+    horário combinado) — evita que o agente pergunte de novo algo que já
+    sabe, mesmo numa sessão nova. Só entra o que o agente coleta: chaves do
+    metadata fora disso (e o nome do perfil do WhatsApp) ficam de fora."""
     metadata = target_info.get("metadata") or {}
-    nome = target_info.get("name") or metadata.get("nome")
 
     dados: dict[str, str] = {}
-    if nome:
-        dados["nome"] = nome
-    for chave in CHAVES_METADATA:
-        if chave == "nome":
-            continue
+    for chave in CHAVES_METADATA if evento else ():
         valor = metadata.get(chave)
         if valor:
             dados[chave] = valor
@@ -412,47 +328,29 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     personality = (agent_info.get("personality") or "").strip()
     rag_enabled = bool(agent_info.get("ragEnabled"))
 
-    if _tem_historico(target_info):
-        fluxo_block = FLUXO_CONTINUO_INSTRUCTION
-    else:
-        fluxo_block = PRIMEIRO_CONTATO_INSTRUCTION
-
     campos = campos_metadados(agent_info)
-    dados_conhecidos_block = _build_known_data_block(target_info, campos)
-    personality_block = PERSONALITY_INSTRUCTION.format(personality=personality or PERSONALITY_VAZIA)
-    rag_block = RAG_INSTRUCTION if rag_enabled else ""
-    rgbs_block = RGBS_INSTRUCTION if (agent_info.get("rgbs") or {}).get("enabled") else ""
+    tem_coleta = bool(campos)
+
     funcoes = funcoes_ativas(agent_info)
     evento = funcoes.get(FUNCAO_EVENTO)
-    if agent_info.get("handoffAfterFunctions"):
-        encerramento = ENCERRAMENTO_HANDOFF_COM_AGENDAMENTO if evento else ENCERRAMENTO_HANDOFF_SEM_AGENDAMENTO
-    else:
-        encerramento = ENCERRAMENTO_COM_AGENDAMENTO if evento else ENCERRAMENTO_SEM_AGENDAMENTO
-    coleta_dados_block = COLETA_DADOS_INSTRUCTION.format(
-        metadados_adicionais_block=_build_metadados_adicionais_block(campos),
-        encerramento=encerramento,
-    )
-    if funcionalidades.tem_envio(agent_info):
-        coleta_dados_block += funcionalidades.COLETA_SEM_FUNCIONALIDADE
+    encerramento = _build_encerramento(tem_coleta, evento, bool(agent_info.get("handoffAfterFunctions")))
 
-    instruction = BASE_INSTRUCTION.format(
-        nome=nome,
-        data_atual_block=_build_data_atual_block(),
-        fluxo_block=fluxo_block,
-        coleta_dados_block=coleta_dados_block,
-        funcoes_block=_build_funcao_evento_block(evento),
-        dados_conhecidos_block=dados_conhecidos_block,
-        personality_block=personality_block,
-        rag_block=rag_block,
-        funcionalidades_block=funcionalidades.build_funcionalidades_block(agent_info),
-        rgbs_block=rgbs_block,
-    )
+    # Ordem importa: os dados conhecidos vêm antes da coleta, que se refere a
+    # eles como "acima". Blocos vazios (função desligada) ficam de fora.
+    blocos = [
+        IDENTIDADE_INSTRUCTION.format(nome=nome),
+        personality,
+        _build_known_data_block(target_info, campos, evento) if tem_coleta else "",
+        _build_coleta_dados_block(campos, encerramento, funcionalidades.tem_envio(agent_info)),
+        _build_data_atual_block() if evento else "",
+        _build_funcao_evento_block(evento, tem_coleta),
+        RAG_INSTRUCTION if rag_enabled else "",
+        funcionalidades.build_funcionalidades_block(agent_info, tem_coleta),
+        RGBS_INSTRUCTION if (agent_info.get("rgbs") or {}).get("enabled") else "",
+    ]
+    instruction = "\n\n".join(b.strip() for b in blocos if b and b.strip())
 
     tools = [
-        atualizar_nome_cliente,
-        atualizar_empresa_cliente,
-        atualizar_volumetria_atendimento,
-        atualizar_uso_sistema_whatsapp,
         solicitar_atendimento_humano,
         encerrar_conversa,
         parar_envio_campanhas,

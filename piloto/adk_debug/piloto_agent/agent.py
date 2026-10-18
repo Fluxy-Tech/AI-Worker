@@ -34,8 +34,8 @@ _agent_config = {
     "handoffAfterFunctions": False,
 }
 
-# Troque metadata/name pra simular um contato que já tem histórico e/ou dados
-# salvos (ver _tem_historico e _build_known_data_block em src/services/adk/agent.py).
+# Troque metadata pra simular um contato com dados já salvos (ver
+# _build_known_data_block em src/services/adk/agent.py).
 _target_info_teste = {
     "id": "user-teste-local",
     "name": "Contato Teste",

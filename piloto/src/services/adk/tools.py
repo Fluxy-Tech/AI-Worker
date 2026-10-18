@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from google.adk.tools import ToolContext
 
 from src.infra.agent_api import client as agent_api
-from src.services.adk.infos import AGENT_TIMEZONE
+from src.services.adk.infos import AGENT_TIMEZONE, STATE_METADADOS_ADICIONAIS
 
 # Chave interna do state da sessão (NÃO entra em CHAVES_METADATA, então não
 # vai pro Target.metadata) — faz agendar_evento remarcar em vez de duplicar.
@@ -49,53 +49,6 @@ def parar_envio_campanhas(tool_context: ToolContext) -> dict:
     return {"ok": True, "mensagem": "Contato marcado para não receber mais campanhas."}
 
 
-# ---------- CAMPOS DO LEAD ----------
-
-
-def atualizar_nome_cliente(tool_context: ToolContext, nome: str) -> dict:
-    """Registra o nome do contato assim que ele informar ou confirmar — só
-    pergunte o nome se ele ainda não estiver nos dados já conhecidos deste
-    contato (ver o início da sua instrução)."""
-    tool_context.state["nome"] = nome
-    return {"nome": nome}
-
-
-def atualizar_empresa_cliente(tool_context: ToolContext, nome_empresa: str) -> dict:
-    """Registra o nome da empresa do contato assim que ele informar ou
-    confirmar — só pergunte se ainda não estiver nos dados já conhecidos
-    deste contato."""
-    tool_context.state["nome_empresa"] = nome_empresa
-    return {"nome_empresa": nome_empresa}
-
-
-def atualizar_volumetria_atendimento(tool_context: ToolContext, nota: int) -> dict:
-    """Registra a volumetria de atendimento da empresa do contato numa escala
-    de 1 a 10, sendo 1 baixa e 10 muito alta. Se o contato responder de forma
-    descritiva (ex: "bem alta"), converta para a nota mais próxima e confirme
-    com ele."""
-    try:
-        nota = int(nota)
-    except (TypeError, ValueError):
-        return {"ok": False, "erro": "A nota precisa ser um número inteiro de 1 a 10."}
-    if not 1 <= nota <= 10:
-        return {"ok": False, "erro": "A nota precisa estar entre 1 e 10 — pergunte de novo ao contato."}
-    tool_context.state["volumetria_atendimento"] = str(nota)
-    return {"ok": True, "volumetria_atendimento": nota}
-
-
-def atualizar_uso_sistema_whatsapp(
-    tool_context: ToolContext, ja_usou: bool, qual_sistema: Optional[str] = None
-) -> dict:
-    """Registra se a empresa do contato já usou algum sistema de
-    gerenciamento de WhatsApp para empresas. Se ele citar qual sistema,
-    preencha qual_sistema."""
-    valor = "Sim" if ja_usou else "Não"
-    if ja_usou and qual_sistema:
-        valor = f"Sim ({qual_sistema})"
-    tool_context.state["ja_usou_sistema_whatsapp"] = valor
-    return {"ok": True, "ja_usou_sistema_whatsapp": valor}
-
-
 # ---------- FUNÇÕES PADRÃO: KANBAN (CRM) E CALENDÁRIO ----------
 # Genéricas de propósito — qualquer agente pode incluir estas tools. O
 # contato é sempre o da conversa (tool_context.user_id = Target.id), o modelo
@@ -122,23 +75,19 @@ def parse_data_hora_futura(texto: str) -> datetime:
 
 
 def titulo_evento_contato(state) -> str:
-    nome = state.get("nome")
-    empresa = state.get("nome_empresa")
-    partes = [p for p in (nome, empresa) if p]
-    return f"Conversa com {' - '.join(partes)}" if partes else "Conversa com lead"
+    """Fallback quando o modelo não deu nome ao evento. Usa o metadado "nome"
+    só se a empresa tiver criado um com essa chave no Agent Console."""
+    nome = (state.get(STATE_METADADOS_ADICIONAIS) or {}).get("nome")
+    return f"Conversa com {nome}" if nome else "Conversa com lead"
 
 
 def descricao_lead(state) -> str:
-    """Resumo determinístico dos dados coletados — usado no evento e como
-    descrição de fallback do card quando o modelo não escreveu uma."""
-    rotulos = (
-        ("nome", "Nome"),
-        ("nome_empresa", "Empresa"),
-        ("volumetria_atendimento", "Volumetria de atendimento (1-10)"),
-        ("ja_usou_sistema_whatsapp", "Já usou sistema de WhatsApp"),
-        ("data_horario_contato", "Melhor data/horário para conversar"),
-    )
-    linhas = [f"{rotulo}: {state.get(chave)}" for chave, rotulo in rotulos if state.get(chave)]
+    """Resumo determinístico dos dados coletados (metadados do Agent Console
+    registrados nesta sessão + o horário agendado) — anexado ao evento."""
+    dados = dict(state.get(STATE_METADADOS_ADICIONAIS) or {})
+    if state.get("data_horario_contato"):
+        dados["data_horario_contato"] = state["data_horario_contato"]
+    linhas = [f"{chave.replace('_', ' ').capitalize()}: {valor}" for chave, valor in dados.items() if valor]
     return "\n".join(linhas)
 
 

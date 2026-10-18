@@ -138,25 +138,33 @@ def _ids_disponiveis(agent_info: dict, tipo: str) -> str:
 
 # ---------- instrução ----------
 
-REGRAS_GERAIS = """
+# O bloco é montado só com as regras que se aplicam às funcionalidades
+# cadastradas no agente (ver build_funcionalidades_block).
+REGRAS_INTRO = """
 ## Funcionalidades de mensagem
 
-Além do texto, você pode enviar mensagens especiais do WhatsApp com as
-ferramentas abaixo. Use cada funcionalidade só na situação descrita em
-"Quando usar" (definida pela empresa) e informe sempre o id dela.
+Além do texto, você pode usar as funcionalidades do WhatsApp abaixo, com as
+ferramentas indicadas em cada uma. Use cada funcionalidade só na situação
+descrita em "Quando usar" (definida pela empresa) e informe sempre o id dela.
+"""
 
-- Parâmetro texto: frase que acompanha o envio. Em botões, listas,
-  localização, prévia de link, formulário e cobrança, deixe vazio para que a sua própria
-  resposta seja o texto da mensagem (recomendado).
+# Só com alguma funcionalidade de envio (respostas contextuais não contam).
+REGRAS_ENVIO = """
+- Parâmetro texto: frase que acompanha o envio.{com_corpo}
 - Não repita por escrito o que já vai no envio (produtos, opções, links).
 - No máximo um envio de cada funcionalidade por resposta.
-- Resposta com envio de funcionalidade = resposta sem coleta de dados. Na
-  mesma resposta em que chamar uma ferramenta de envio (enviar_*,
-  solicitar_localizacao ou enviar_cobranca), NÃO faça nenhuma pergunta da
-  "Coleta de dados obrigatória" nem dos dados adicionais: nem no seu texto,
-  nem no parâmetro texto da ferramenta. Essa resposta fala só do envio.
-  Retome a coleta na próxima resposta que for só texto livre, sem
-  funcionalidade.
+"""
+
+REGRA_TEXTO_COM_CORPO = """ Em {tipos}, deixe vazio para
+  que a sua própria resposta seja o texto da mensagem (recomendado)."""
+
+# Só quando o agente também tem metadados para coletar (ver
+# agent._build_coleta_dados_block) — sem isso as duas instruções brigam.
+REGRA_SEM_COLETA_NO_ENVIO = """- Resposta com envio de funcionalidade = resposta sem coleta de dados. Na
+  mesma resposta em que chamar uma ferramenta de envio, NÃO faça nenhuma
+  pergunta da "Coleta de dados obrigatória": nem no seu texto, nem no
+  parâmetro texto da ferramenta. Essa resposta fala só do envio. Retome a
+  coleta na próxima resposta que for só texto livre, sem funcionalidade.
 """
 
 
@@ -173,6 +181,19 @@ Faça as perguntas desta coleta só em respostas de texto livre. Nunca pergunte
 nenhum destes dados na mesma resposta em que enviar uma funcionalidade de
 mensagem (ver "Funcionalidades de mensagem"): deixe para a próxima resposta.
 """
+
+
+def _build_regras(funcionalidades: list[dict], tem_coleta: bool) -> str:
+    tipos = list(dict.fromkeys(f.get("type") for f in funcionalidades))
+    partes = [REGRAS_INTRO]
+    if any(t != CONTEXTUAL_REPLY for t in tipos):
+        com_corpo = [ROTULO[t].lower() for t in tipos if t in TIPOS_COM_CORPO]
+        partes.append(REGRAS_ENVIO.format(
+            com_corpo=REGRA_TEXTO_COM_CORPO.format(tipos=", ".join(com_corpo)) if com_corpo else "",
+        ))
+        if tem_coleta:
+            partes.append(REGRA_SEM_COLETA_NO_ENVIO)
+    return "".join(partes)
 
 
 def _detalhes(funcionalidade: dict) -> list[str]:
@@ -248,11 +269,14 @@ def _detalhes(funcionalidade: dict) -> list[str]:
     return linhas
 
 
-def build_funcionalidades_block(agent_info: dict) -> str:
+def build_funcionalidades_block(agent_info: dict, tem_coleta: bool) -> str:
+    """Só as funcionalidades cadastradas no agente (agent.features — FLOW já
+    chega filtrado pelo WABA/status no Inbound-Service). Sem nenhuma, o bloco
+    não entra no prompt."""
     funcionalidades = listar(agent_info)
     if not funcionalidades:
         return ""
-    partes = [REGRAS_GERAIS]
+    partes = [_build_regras(funcionalidades, tem_coleta)]
     for f in funcionalidades:
         partes.append(f"### {f.get('name') or ROTULO.get(f['type'], f['type'])} (id: {f['id']})")
         partes.append(f"Tipo: {ROTULO.get(f['type'], f['type'])} | ferramenta: {FERRAMENTA.get(f['type'])}")

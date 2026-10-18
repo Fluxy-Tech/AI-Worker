@@ -6,7 +6,6 @@ from google.adk.runners import Runner
 from google.genai import types
 from src.services.adk.infos import (
     APP_NAME,
-    CHAVES_COLETA_FIXA,
     CHAVES_METADATA,
     FUNCAO_CARD,
     GOOGLE_ADK_MODEL,
@@ -26,20 +25,19 @@ from src.services.adk.agent import LABELS_METADATA, build_agent, campos_metadado
 
 
 def _dados_do_contato(target_info: dict, state: dict) -> dict:
-    """Tudo que já se sabe do contato: Target.metadata do payload + nome do
-    perfil do WhatsApp + o que foi coletado nesta sessão (state)."""
+    """Tudo que já se sabe do contato: Target.metadata do payload + o que foi
+    coletado nesta sessão (state)."""
     metadata = target_info.get("metadata") or {}
     dados = {k: v for k, v in metadata.items() if v not in (None, "")}
-    if target_info.get("name") and not dados.get("nome"):
-        dados["nome"] = target_info["name"]
     dados.update(state.get(STATE_METADADOS_ADICIONAIS) or {})
     dados.update({k: state[k] for k in CHAVES_METADATA if state.get(k)})
     return dados
 
 
 def _coleta_completa(dados: dict, campos: list[dict]) -> bool:
-    chaves = list(CHAVES_COLETA_FIXA) + [c["chave"] for c in campos]
-    return all(dados.get(chave) for chave in chaves)
+    """Só os metadados ativos do Agent Console contam. Sem nenhum cadastrado
+    não existe coleta, então o momento "após a coleta" nunca dispara."""
+    return bool(campos) and all(dados.get(c["chave"]) for c in campos)
 
 
 def _formatar_dados(dados: dict, campos: list[dict]) -> str:
@@ -86,7 +84,7 @@ def _executar_funcao_card(
     conversa — determinística, roda aqui no runner e não depende do modelo
     chamar uma tool.
     - Início da conversa: primeiro turno de uma sessão ADK nova.
-    - Após a coleta: no turno em que a coleta (fixa + metadados ativos)
+    - Após a coleta: no turno em que a coleta (metadados ativos do Console)
       passou de incompleta pra completa."""
     card = funcoes_ativas(agent_config).get(FUNCAO_CARD)
     if not card:
@@ -253,11 +251,11 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
                 resposta_final = agent_config["closingMessage"]
 
             # contato_iniciado é sempre marcado (não depende de nenhuma tool
-            # ter sido chamada) — é o sinal que agent._tem_historico usa pra
-            # saber se já trocamos mensagem com este contato antes, e por
-            # isso não pode depender do modelo lembrar de chamar uma tool.
+            # ter sido chamada) — registra no contato que já trocamos
+            # mensagem com ele antes. O prompt não usa mais esse sinal.
             # Metadados do Agent Console (registrar_metadado) primeiro, pra que
-            # nunca sobrescrevam os fixos nem contato_iniciado.
+            # nunca sobrescrevam os do worker (CHAVES_METADATA) nem
+            # contato_iniciado.
             metadata = dict(sessao_final.state.get(STATE_METADADOS_ADICIONAIS) or {})
             metadata.update({chave: sessao_final.state[chave] for chave in CHAVES_METADATA if chave in sessao_final.state})
             metadata["contato_iniciado"] = True

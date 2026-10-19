@@ -157,7 +157,7 @@ RGBS_MARKER = "[QB]"
 # rápido que o mínimo, mesmo com payload antigo/incompleto.
 RGBS_SMALL_MAX_CHARS = 40
 RGBS_MEDIUM_MAX_CHARS = 100
-RGBS_MIN_SECONDS = {"timeSmall": 5, "timeMedium": 10, "timeLarge": 15}
+RGBS_MIN_SECONDS = {"timeSmall": 1, "timeMedium": 4, "timeLarge": 8}
 
 
 def _split_rgbs(texto: str) -> list[str]:

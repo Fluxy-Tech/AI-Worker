@@ -106,7 +106,12 @@ def _descricao_evento(descricao: str, state) -> str | None:
 
 
 def agendar_evento(
-    tool_context: ToolContext, data_hora: str, nome: str, descricao: str, evento_id: Optional[str] = None
+    tool_context: ToolContext,
+    data_hora: str,
+    nome: str,
+    descricao: str,
+    evento_id: Optional[str] = None,
+    novo_evento: bool = False,
 ) -> dict:
     """Agenda o evento com o contato no dia e horário que ele escolheu, ou
     remarca um evento dele para uma nova data futura.
@@ -117,7 +122,12 @@ def agendar_evento(
 
     evento_id: para remarcar um evento que o contato já tem, o id dele
     (de consultar_eventos_calendario). Vazio = remarca o evento agendado
-    nesta conversa, se houver, ou cria um novo.
+    nesta conversa, se houver. Se o contato já tiver eventos ativos de
+    outra conversa, nada é criado: a resposta vem com
+    precisa_confirmar_evento=true e a lista "eventos_ativos" — pergunte ao
+    contato qual deles ele quer alterar e chame de novo com o evento_id.
+    novo_evento: true só quando o contato pedir explicitamente um evento
+    ADICIONAL, mantendo os que já tem.
 
     nome: título curto e claro do evento, que diga o que é e com quem (ex:
     "Demonstração da plataforma - Ana (Loja X)").
@@ -136,13 +146,36 @@ def agendar_evento(
         return {"ok": False, "erro": str(e)}
 
     target_id = tool_context.user_id
+    evento_id = (evento_id or "").strip() or tool_context.state.get(STATE_EVENTO_CALENDARIO_ID)
+    # Sem evento definido, o contato pode estar falando de um evento marcado
+    # em outra conversa (o id da sessão se perde no reset/fim da sessão):
+    # nunca cria um novo por cima — o modelo confirma qual é e manda o id.
+    if not evento_id and not novo_evento:
+        try:
+            ativos = [e for e in _eventos_ativos(target_id) if _no_futuro(e["dateEvent"])]
+        except Exception as e:
+            print(f"[piloto] Falha ao consultar eventos do contato {target_id} antes de agendar: {e}")
+            return {"ok": False, "erro": "Não foi possível acessar a agenda agora."}
+        if ativos:
+            return {
+                "ok": False,
+                "precisa_confirmar_evento": True,
+                "eventos_ativos": [
+                    {"id": e.get("id"), "titulo": e.get("name"), "data_hora": _data_local(e["dateEvent"])} for e in ativos
+                ],
+                "instrucao": (
+                    "O contato já tem evento(s) agendado(s). Nada foi criado. Pergunte qual deles ele quer "
+                    "alterar (se for só um, confirme que é esse) e chame agendar_evento de novo com o evento_id "
+                    "dele. Só use novo_evento=true se o contato pedir explicitamente um evento a mais."
+                ),
+            }
     try:
         resultado = agent_api.agendar_evento_calendario(
             target_id,
             nome=((nome or "").strip() or titulo_evento_contato(tool_context.state))[:LIMITE_NOME_EVENTO],
             data_evento_iso=quando.isoformat(),
             descricao=_descricao_evento(descricao, tool_context.state),
-            evento_id=(evento_id or "").strip() or tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
+            evento_id=evento_id,
         )
     except agent_api.HorarioIndisponivelError as e:
         return {"ok": False, "disponivel": False, "motivo": str(e)}
@@ -177,11 +210,21 @@ def _data_local(iso: str) -> str:
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(tz).strftime("%d/%m/%Y %H:%M")
 
 
+def _no_futuro(iso: str) -> bool:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")) > datetime.now(ZoneInfo(AGENT_TIMEZONE))
+
+
+def _eventos_ativos(target_id: str) -> list[dict]:
+    """Eventos do contato que ainda podem ser alterados (não cancelados nem
+    encerrados)."""
+    eventos = agent_api.consultar_eventos_calendario(target_id).get("contactEvents", [])
+    return [e for e in eventos if e.get("status") != "CANCELED" and not e.get("isClosed")]
+
+
 def _proximo_evento_ativo(target_id: str) -> str:
     """Data local do próximo evento não cancelado do contato ("" = nenhum) —
     o que fica em data_horario_contato depois de desmarcar um evento."""
-    eventos = agent_api.consultar_eventos_calendario(target_id).get("contactEvents", [])
-    ativos = [e for e in eventos if e.get("status") != "CANCELED" and not e.get("isClosed")]
+    ativos = _eventos_ativos(target_id)
     return _data_local(ativos[0]["dateEvent"]) if ativos else ""
 
 

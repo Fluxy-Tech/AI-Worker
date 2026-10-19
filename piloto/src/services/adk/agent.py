@@ -149,6 +149,12 @@ contato com quem será. Chamar de novo na mesma conversa remarca o mesmo
 evento. consultar_eventos_calendario mostra os horários já ocupados, útil
 para sugerir alternativas.
 
+Se o contato já tiver evento agendado (inclusive de outra conversa), não
+crie outro: se a resposta vier com precisa_confirmar_evento=true, pergunte
+qual dos "eventos_ativos" ele quer alterar (se for só um, confirme que é
+esse) e chame agendar_evento de novo com o evento_id dele. Só passe
+novo_evento=true se o contato pedir explicitamente um evento a mais.
+
 {momentos}
 
 ### Agenda do contato
@@ -157,8 +163,9 @@ O contato pode perguntar sobre os eventos dele: use consultar_eventos_calendario
 e informe o dia, o horário e com quem é cada evento (o "responsavel"). Fale
 só dos eventos dele, nunca dos horários de outras pessoas.
 
-- Remarcar: se ele quiser mudar a data de um evento, confirme qual é e a nova
-  data (sempre futura) e chame agendar_evento com o evento_id dele.
+- Remarcar/atualizar: se ele quiser mudar um evento, use consultar_eventos_calendario,
+  confirme com ele qual é o evento e a nova data (sempre futura) e chame
+  agendar_evento com o evento_id dele. Nunca crie um evento novo para isso.
 - Desmarcar: se ele quiser cancelar, confirme qual evento é e chame
   desmarcar_evento com o evento_id. Depois, pergunte se ele quer marcar outra
   data.

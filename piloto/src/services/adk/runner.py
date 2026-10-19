@@ -20,7 +20,12 @@ from src.infra.agent_api.client import (
     resetar_metadados_contato,
     sincronizar_metadados_contato,
 )
-from src.services.adk.funcionalidades import FERRAMENTAS_DE_ENVIO
+from src.services.adk.funcionalidades import (
+    FERRAMENTAS_DE_ENVIO,
+    chave_flow_respondido,
+    flows_da_coleta,
+    flows_respondidos_no_texto,
+)
 from src.services.adk.agent import LABELS_METADATA, build_agent, campos_metadados, funcoes_ativas
 
 
@@ -34,16 +39,22 @@ def _dados_do_contato(target_info: dict, state: dict) -> dict:
     return dados
 
 
-def _coleta_completa(dados: dict, campos: list[dict]) -> bool:
-    """Só os metadados ativos do Agent Console contam. Sem nenhum cadastrado
-    não existe coleta, então o momento "após a coleta" nunca dispara."""
-    return bool(campos) and all(dados.get(c["chave"]) for c in campos)
+def _coleta_completa(dados: dict, campos: list[dict], flows: list[dict]) -> bool:
+    """Só contam os metadados ativos do Agent Console e os Flows da coleta
+    (marcador de respondido). Sem nenhum dos dois não existe coleta, então o
+    momento "após a coleta" nunca dispara."""
+    return (
+        bool(campos or flows)
+        and all(dados.get(c["chave"]) for c in campos)
+        and all(dados.get(chave_flow_respondido(f["id"])) for f in flows)
+    )
 
 
-def _formatar_dados(dados: dict, campos: list[dict]) -> str:
+def _formatar_dados(dados: dict, campos: list[dict], flows: list[dict]) -> str:
     labels = dict(LABELS_METADATA)
     labels.update({c["chave"]: c["nome"] for c in campos})
-    chaves = list(CHAVES_METADATA) + [c["chave"] for c in campos]
+    labels.update({chave_flow_respondido(f["id"]): f'Formulário "{f.get("name") or f["id"]}" respondido em' for f in flows})
+    chaves = list(CHAVES_METADATA) + [c["chave"] for c in campos] + [chave_flow_respondido(f["id"]) for f in flows]
     return "\n".join(f"- {labels.get(k, k)}: {dados[k]}" for k in chaves if dados.get(k))
 
 
@@ -78,33 +89,39 @@ def _executar_funcao_card(
     estado_antes: dict,
     estado_depois: dict,
     eventos: list,
+    pergunta: str,
 ) -> None:
     """Função KANBAN_CARD (card "Funções" do Console): cria o card do contato
     (prioridade Alta) e comenta nele os dados coletados e um resumo da
     conversa — determinística, roda aqui no runner e não depende do modelo
     chamar uma tool.
     - Início da conversa: primeiro turno de uma sessão ADK nova.
-    - Após a coleta: no turno em que a coleta (metadados ativos do Console)
-      passou de incompleta pra completa."""
+    - Após a coleta: no turno em que a coleta (metadados ativos do Console e
+      Flows da coleta) passou de incompleta pra completa."""
     card = funcoes_ativas(agent_config).get(FUNCAO_CARD)
     if not card:
         return
 
     campos = campos_metadados(agent_config)
-    dados_antes = _dados_do_contato(target_info, estado_antes)
+    flows = flows_da_coleta(agent_config)
     dados_depois = _dados_do_contato(target_info, estado_depois)
+    # O marcador do Flow respondido neste turno já chega no metadata do
+    # payload (o Inbound-Service grava antes de mandar): pro "antes" ele
+    # ainda não existia.
+    novos = {chave_flow_respondido(i) for i in flows_respondidos_no_texto(pergunta)}
+    dados_antes = {k: v for k, v in _dados_do_contato(target_info, estado_antes).items() if k not in novos}
 
     titulos = []
     if card["inicio"] and inicio_conversa:
         titulos.append("Nova conversa iniciada pelo contato.")
-    if card["apos_coleta"] and _coleta_completa(dados_depois, campos) and not _coleta_completa(dados_antes, campos):
+    if card["apos_coleta"] and _coleta_completa(dados_depois, campos, flows) and not _coleta_completa(dados_antes, campos, flows):
         titulos.append("Coleta de dados concluída.")
     if not titulos:
         return
 
     # Um resumo só por turno, mesmo que os dois momentos caiam juntos.
     resumo = gerar_resumo_conversa(_transcricao(eventos), agent_config.get("openaiToken"), agent_config.get("id"))
-    dados = _formatar_dados(dados_depois, campos)
+    dados = _formatar_dados(dados_depois, campos, flows)
 
     for titulo in titulos:
         comentario = _montar_comentario_card(titulo, dados, resumo)
@@ -270,6 +287,7 @@ async def _executar(pergunta: str, user_id: str, session_id: str, agent_config: 
                 estado_antes,
                 dict(sessao_final.state),
                 sessao_final.events,
+                pergunta,
             )
 
         # Sem isso, handoff_requested/closing_requested ficam GRUDADOS pra

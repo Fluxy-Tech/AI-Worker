@@ -97,7 +97,8 @@ indicada:
 COLETA_FLOWS = """Estes formulários (Flows) {tambem}fazem parte da coleta: envie cada um com
 enviar_flow, informando o id, no momento do "Quando usar" dele{sem_momento}, e
 espere o contato responder antes de seguir. Um formulário está respondido
-quando chega a mensagem "📝 Respondeu o formulário ..."; as respostas são
+quando chega a mensagem "📝 Respondeu o formulário ..." ou quando ele aparece
+em "Dados já registrados" acima; as respostas são
 salvas sozinhas nos metadados do contato, então não pergunte de novo o que
 ele preencheu, não chame registrar_metadado para elas e não reenvie um
 formulário já respondido:
@@ -253,7 +254,7 @@ def campos_metadados(agent_info: dict) -> list[dict]:
     campos = []
     for campo in agent_info.get("metadataFields") or []:
         chave = (campo.get("nameToAgent") or "").strip()
-        if chave and chave not in CHAVES_RESERVADAS:
+        if chave and chave not in CHAVES_RESERVADAS and not chave.startswith(funcionalidades.CHAVE_FLOW_RESPONDIDO):
             campos.append({"chave": chave, "nome": campo.get("name") or chave, "regra": (campo.get("rule") or "").strip()})
     return campos
 
@@ -297,12 +298,13 @@ def _build_encerramento(tem_coleta: bool, evento: dict | None, handoff: bool) ->
     return modelo.format(condicao=condicao)
 
 
-def _build_known_data_block(target_info: dict, campos: list[dict], evento: dict | None) -> str: # Função de coletar os metadados e passar para o agente
+def _build_known_data_block(target_info: dict, campos: list[dict], evento: dict | None, flows: list[dict]) -> str: # Função de coletar os metadados e passar para o agente
     """Dados que já existem no cadastro do contato (metadados do Agent Console
-    já registrados em conversa anterior e, com o agendamento ligado, o
-    horário combinado) — evita que o agente pergunte de novo algo que já
-    sabe, mesmo numa sessão nova. Só entra o que o agente coleta: chaves do
-    metadata fora disso (e o nome do perfil do WhatsApp) ficam de fora."""
+    já registrados em conversa anterior, os Flows da coleta já respondidos e,
+    com o agendamento ligado, o horário combinado) — evita que o agente
+    pergunte de novo algo que já sabe, mesmo numa sessão nova. Só entra o que
+    o agente coleta: chaves do metadata fora disso (e o nome do perfil do
+    WhatsApp) ficam de fora."""
     metadata = target_info.get("metadata") or {}
 
     dados: dict[str, str] = {}
@@ -317,6 +319,13 @@ def _build_known_data_block(target_info: dict, campos: list[dict], evento: dict 
         if valor:
             dados[campo["chave"]] = valor
             labels[campo["chave"]] = f"{campo['nome']} ({campo['chave']})"
+
+    for flow in flows:
+        chave = funcionalidades.chave_flow_respondido(flow["id"])
+        valor = metadata.get(chave)
+        if valor:
+            dados[chave] = f"respondido em {valor}"
+            labels[chave] = f'Formulário "{flow.get("name") or flow["id"]}" (id: {flow["id"]})'
 
     if not dados:
         return "Nenhum dado deste contato foi registrado ainda."
@@ -396,7 +405,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     blocos = [
         IDENTIDADE_INSTRUCTION.format(nome=nome),
         personality,
-        _build_known_data_block(target_info, campos, evento) if tem_coleta else "",
+        _build_known_data_block(target_info, campos, evento, flows_coleta) if tem_coleta else "",
         _build_coleta_dados_block(campos, flows_coleta, encerramento, funcionalidades.tem_envio(agent_info)),
         funcionalidades.build_funcionalidades_block(agent_info, tem_coleta),
         _build_data_atual_block() if evento else "",

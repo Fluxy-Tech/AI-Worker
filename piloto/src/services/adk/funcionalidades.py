@@ -186,6 +186,25 @@ REGRA_SEM_COLETA_NO_ENVIO = """- Resposta com envio de funcionalidade = resposta
 """
 
 
+# Marcador que o Inbound-Service grava em Target.metadata quando um Flow com
+# "salvar como metadados" é respondido: "flow_respondido_<id>" = data/hora
+# (FLOW_ANSWERED_METADATA_PREFIX em interactive-reply-service.ts).
+CHAVE_FLOW_RESPONDIDO = "flow_respondido_"
+
+# Texto da resposta do Flow que o Inbound-Service manda pro agente:
+# '📝 Respondeu o formulário "<nome>" (id: <id>)...'.
+RE_FLOW_RESPONDIDO = re.compile(r'📝 Respondeu o formulário ".*?" \(id: ([^\s)]+)\)')
+
+
+def chave_flow_respondido(flow_id: str) -> str:
+    return f"{CHAVE_FLOW_RESPONDIDO}{flow_id}"
+
+
+def flows_respondidos_no_texto(texto: str) -> set[str]:
+    """Ids dos Flows respondidos nas mensagens deste turno."""
+    return set(RE_FLOW_RESPONDIDO.findall(texto or ""))
+
+
 def flows_da_coleta(agent_info: dict) -> list[dict]:
     """Flows com "salvar como metadados" ligado: entram na "Coleta de dados
     obrigatória" (ver agent._build_coleta_dados_block), não no bloco de

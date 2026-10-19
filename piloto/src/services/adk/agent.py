@@ -388,6 +388,48 @@ def _build_rag_tool(agent_id: str, openai_api_key: str | None): # Retorna os chu
     return consultar_conhecimento
 
 
+# Agent.limitHistoryToAgent (Agent Console › Identidade): quantas das últimas
+# mensagens trocadas da sessão vão pro modelo. Os mesmos limites do Agent-Api.
+LIMITE_HISTORICO_PADRAO = 6
+LIMITE_HISTORICO_MINIMO = 2
+
+
+def _e_mensagem(content) -> bool:
+    """Fala do contato ou do agente (com texto) — chamadas e respostas de
+    ferramenta não contam como mensagem trocada."""
+    partes = content.parts or []
+    return any(getattr(p, "text", None) for p in partes) and not any(
+        getattr(p, "function_call", None) or getattr(p, "function_response", None) for p in partes
+    )
+
+
+def _limitar_historico(limite: int):
+    """before_model_callback: corta o histórico da sessão nas últimas `limite`
+    mensagens trocadas antes de cada chamada ao modelo. As ferramentas
+    chamadas no meio do trecho mantido seguem junto. O corte sempre começa
+    numa fala do contato (o Gemini não aceita histórico começando pelo modelo
+    nem por resposta de ferramenta solta): se cair numa fala do agente, volta
+    até a fala do contato que a originou (no máximo 1 mensagem a mais)."""
+
+    def callback(callback_context, llm_request):
+        contents = llm_request.contents or []
+        contadas = 0
+        inicio = 0
+        for i in range(len(contents) - 1, -1, -1):
+            if _e_mensagem(contents[i]):
+                contadas += 1
+                if contadas == limite:
+                    inicio = i
+                    break
+        while inicio > 0 and not (contents[inicio].role == "user" and _e_mensagem(contents[inicio])):
+            inicio -= 1
+        if inicio > 0:
+            llm_request.contents = contents[inicio:]
+        return None
+
+    return callback
+
+
 def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     """Monta o Agent do ADK do zero a cada mensagem (não é um root_agent fixo
     como no axel) — instrução e ferramentas variam por agent_info (personality/
@@ -439,6 +481,11 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
 
     tools.extend(funcionalidades.build_tools(agent_info, target_info))
 
+    try:
+        limite_historico = max(int(agent_info.get("limitHistoryToAgent") or LIMITE_HISTORICO_PADRAO), LIMITE_HISTORICO_MINIMO)
+    except (TypeError, ValueError):
+        limite_historico = LIMITE_HISTORICO_PADRAO
+
     return Agent(
         # Nome interno do ADK — fixo, não é o nome de exibição do agente (que
         # pode ter espaços/acentos, ex: "Assistente Virtual"). O nome de
@@ -452,4 +499,5 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         # do Agent Console) tivesse algo como "{cidade}".
         instruction=lambda _ctx: instruction,
         tools=tools,
+        before_model_callback=_limitar_historico(limite_historico),
     )

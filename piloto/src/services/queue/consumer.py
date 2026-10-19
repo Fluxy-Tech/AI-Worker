@@ -27,6 +27,7 @@ agrupado/debounced por sessão em janelas de 10s):
     "functions": [{"type", "runAtStart", "runAfterMetadata"}],  # CALENDAR_EVENT / KANBAN_CARD
     "handoffAfterFunctions",        # fim do roteiro: true = atendimento humano, false = encerrar
     "rgbs": {"enabled", "timeSmall", "timeMedium", "timeLarge"},  # quebra em [QB] + espera por tamanho
+    "limitHistoryToAgent",          # últimas mensagens trocadas da sessão que vão pro modelo (agent.py)
     "features": [{"id", "type", "name", "prompt", "config", "products"?}],  # funcionalidades de mensagem (funcionalidades.py)
   },
   "messagingSession": {"id", "startedAt"},

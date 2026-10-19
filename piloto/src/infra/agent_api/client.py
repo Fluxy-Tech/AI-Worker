@@ -313,6 +313,21 @@ class HorarioIndisponivelError(RuntimeError):
     evento no horário), pra o agente pedir outro horário ao contato."""
 
 
+class EventoInvalidoError(RuntimeError):
+    """404/4xx de validação ao remarcar/desmarcar (evento não é do contato,
+    encerrado, cancelado ou já passou) — a mensagem vai pro agente explicar."""
+
+
+def _raise_for_evento_error(response: httpx.Response) -> None:
+    if response.status_code in (400, 404, 422):
+        try:
+            message = response.json().get("message")
+        except Exception:
+            message = None
+        raise EventoInvalidoError(message or "Evento inválido.")
+    _raise_for_api_error(response)
+
+
 def agendar_evento_calendario(
     target_id: str,
     nome: str,
@@ -336,7 +351,19 @@ def agendar_evento_calendario(
     )
     if response.status_code == 409:
         raise HorarioIndisponivelError(response.json().get("message") or "Horário indisponível.")
-    _raise_for_api_error(response)
+    _raise_for_evento_error(response)
+    return response.json().get("result") or {}
+
+
+def desmarcar_evento_calendario(target_id: str, evento_id: str) -> dict:
+    """Função CALENDAR_EVENT: o contato desmarca um evento dele (status
+    CANCELED, não apaga)."""
+    response = httpx.post(
+        f"{BASE_URL}/internal/targets/{target_id}/calendar-events/{evento_id}/cancel",
+        headers={"x-internal-api-key": INTERNAL_API_KEY},
+        timeout=10,
+    )
+    _raise_for_evento_error(response)
     return response.json().get("result") or {}
 
 

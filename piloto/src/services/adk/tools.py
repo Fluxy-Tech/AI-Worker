@@ -105,12 +105,19 @@ def _descricao_evento(descricao: str, state) -> str | None:
     return "\n\n".join(partes)[:LIMITE_DESCRICAO_EVENTO] or None
 
 
-def agendar_evento(tool_context: ToolContext, data_hora: str, nome: str, descricao: str) -> dict:
-    """Agenda o evento com o contato no dia e horário que ele escolheu.
+def agendar_evento(
+    tool_context: ToolContext, data_hora: str, nome: str, descricao: str, evento_id: Optional[str] = None
+) -> dict:
+    """Agenda o evento com o contato no dia e horário que ele escolheu, ou
+    remarca um evento dele para uma nova data futura.
     data_hora no formato AAAA-MM-DDTHH:MM, no horário local (ex:
     "2026-09-30T14:00") — converta expressões como "amanhã às 14h" usando a
     data atual informada na sua instrução. Se o contato der só o dia ou um
     período vago, pergunte o horário exato antes de chamar.
+
+    evento_id: para remarcar um evento que o contato já tem, o id dele
+    (de consultar_eventos_calendario). Vazio = remarca o evento agendado
+    nesta conversa, se houver, ou cria um novo.
 
     nome: título curto e claro do evento, que diga o que é e com quem (ex:
     "Demonstração da plataforma - Ana (Loja X)").
@@ -135,10 +142,12 @@ def agendar_evento(tool_context: ToolContext, data_hora: str, nome: str, descric
             nome=((nome or "").strip() or titulo_evento_contato(tool_context.state))[:LIMITE_NOME_EVENTO],
             data_evento_iso=quando.isoformat(),
             descricao=_descricao_evento(descricao, tool_context.state),
-            evento_id=tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
+            evento_id=(evento_id or "").strip() or tool_context.state.get(STATE_EVENTO_CALENDARIO_ID),
         )
     except agent_api.HorarioIndisponivelError as e:
         return {"ok": False, "disponivel": False, "motivo": str(e)}
+    except agent_api.EventoInvalidoError as e:
+        return {"ok": False, "erro": str(e)}
     except Exception as e:
         print(f"[piloto] Falha ao agendar evento do contato {target_id}: {e}")
         return {"ok": False, "erro": "Não foi possível acessar a agenda agora."}
@@ -160,14 +169,54 @@ def agendar_evento(tool_context: ToolContext, data_hora: str, nome: str, descric
     return resposta
 
 
+STATUS_EVENTO = {"RESCHEDULED": "REMARCADO", "CANCELED": "CANCELADO", "FINISHED": "ENCERRADO"}
+
+
+def _data_local(iso: str) -> str:
+    tz = ZoneInfo(AGENT_TIMEZONE)
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(tz).strftime("%d/%m/%Y %H:%M")
+
+
+def _proximo_evento_ativo(target_id: str) -> str:
+    """Data local do próximo evento não cancelado do contato ("" = nenhum) —
+    o que fica em data_horario_contato depois de desmarcar um evento."""
+    eventos = agent_api.consultar_eventos_calendario(target_id).get("contactEvents", [])
+    ativos = [e for e in eventos if e.get("status") != "CANCELED" and not e.get("isClosed")]
+    return _data_local(ativos[0]["dateEvent"]) if ativos else ""
+
+
+def desmarcar_evento(tool_context: ToolContext, evento_id: str) -> dict:
+    """Desmarca (cancela) um evento futuro do contato, quando ele pedir.
+    evento_id: o id do evento (de consultar_eventos_calendario). Confirme com
+    o contato qual evento é antes de chamar. Se ele quiser só mudar a data,
+    use agendar_evento com o evento_id em vez de desmarcar."""
+    target_id = tool_context.user_id
+    try:
+        agent_api.desmarcar_evento_calendario(target_id, (evento_id or "").strip())
+    except agent_api.EventoInvalidoError as e:
+        return {"ok": False, "erro": str(e)}
+    except Exception as e:
+        print(f"[piloto] Falha ao desmarcar evento do contato {target_id}: {e}")
+        return {"ok": False, "erro": "Não foi possível acessar a agenda agora."}
+
+    if tool_context.state.get(STATE_EVENTO_CALENDARIO_ID) == evento_id:
+        tool_context.state[STATE_EVENTO_CALENDARIO_ID] = None
+    try:
+        tool_context.state["data_horario_contato"] = _proximo_evento_ativo(target_id)
+    except Exception as e:
+        print(f"[piloto] Falha ao atualizar o horario combinado do contato {target_id}: {e}")
+    return {"ok": True, "acao": "desmarcado"}
+
+
 def consultar_eventos_calendario(
     tool_context: ToolContext, data_inicio: Optional[str] = None, data_fim: Optional[str] = None
 ) -> dict:
-    """Consulta os eventos já marcados com este contato e os horários já
-    ocupados na agenda da empresa. Datas no formato AAAA-MM-DD ou
-    AAAA-MM-DDTHH:MM (horário local); sem datas = próximos 30 dias (máx. 62
-    dias por consulta). Use antes de propor/confirmar um horário."""
-    tz = ZoneInfo(AGENT_TIMEZONE)
+    """Consulta a agenda deste contato: os eventos dele (id, data/horário,
+    status e com quem é — o responsável) e os horários já ocupados na agenda
+    da empresa. Datas no formato AAAA-MM-DD ou AAAA-MM-DDTHH:MM (horário
+    local); sem datas = próximos 30 dias (máx. 62 dias por consulta). Use
+    para responder o contato sobre os eventos dele, antes de propor/confirmar
+    um horário e para achar o id de um evento a remarcar ou desmarcar."""
     try:
         de = parse_data_hora(data_inicio) if data_inicio else None
         ate = parse_data_hora(data_fim) if data_fim else None
@@ -187,21 +236,20 @@ def consultar_eventos_calendario(
         print(f"[julia] Falha ao consultar eventos do contato {tool_context.user_id}: {e}")
         return {"ok": False, "erro": "Não foi possível consultar a agenda agora."}
 
-    def _local(iso: str) -> str:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(tz).strftime("%d/%m/%Y %H:%M")
-
     return {
         "ok": True,
         "eventos_do_contato": [
             {
+                "id": e.get("id"),
                 "titulo": e.get("name"),
-                "data_hora": _local(e["dateEvent"]),
+                "data_hora": _data_local(e["dateEvent"]),
+                "responsavel": e.get("responsible"),
                 "descricao": e.get("description"),
-                "status": e.get("status") or ("ENCERRADO" if e.get("isClosed") else "AGENDADO"),
+                "status": "ENCERRADO" if e.get("isClosed") else STATUS_EVENTO.get(e.get("status"), "AGENDADO"),
             }
             for e in resultado.get("contactEvents", [])
         ],
-        "horarios_ocupados": [_local(e["dateEvent"]) for e in resultado.get("busySlots", [])],
+        "horarios_ocupados": [_data_local(e["dateEvent"]) for e in resultado.get("busySlots", [])],
     }
 
 

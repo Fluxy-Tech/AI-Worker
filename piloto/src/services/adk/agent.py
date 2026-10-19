@@ -17,26 +17,30 @@ from src.services.adk.rag_graph import consultar_base_de_conhecimento
 from src.services.adk.tools import (
     agendar_evento,
     consultar_eventos_calendario,
+    desmarcar_evento,
     encerrar_conversa,
     parar_envio_campanhas,
     solicitar_atendimento_humano,
 )
 
 # O prompt é só a Identidade do Agent Console (nome + personalidade) e os
-# blocos das funções ligadas no agente — nenhum texto fixo além disso. Cada
-# bloco abaixo entra só com a sua condição (vazio = fica de fora):
-# - identidade: "Você é {nome}." + personalidade (sempre)
-# - dados_conhecidos_block: metadados já salvos do contato (só com metadados)
-# - coleta_dados_block: coleta dos metadados criados no card "Metadados" do
-#   Console + como encerrar (só com metadados e/ou agendamento)
-# - data_atual_block + funcoes_block: agendamento (só com CALENDAR_EVENT — a
-#   data é a base pra converter "amanhã às 14h"; o card do Kanban roda no
-#   runner, sem instrução)
-# - rag_block: uso da base de conhecimento (só com ragEnabled)
-# - funcionalidades_block: funcionalidades de mensagem cadastradas no Console
-#   (catálogo, botões, listas, carrosséis...) — ver funcionalidades.py
-# - rgbs_block: quebra da resposta em várias mensagens com [QB] (só com RGBS
-#   ligado — o consumer faz o split e envia uma por vez)
+# blocos das funções ligadas no agente — nenhum texto fixo além disso. A
+# ordem é sempre esta, e cada bloco entra só com a sua condição (vazio = fica
+# de fora):
+# 1. identidade: "Você é {nome}." + personalidade (sempre)
+# 2. dados_conhecidos_block: metadados já salvos do contato (só com coleta)
+# 3. coleta_dados_block: metadados do card "Metadados" do Console + Flows com
+#    "salvar como metadados" + como encerrar (só com coleta e/ou agendamento)
+# 4. funcionalidades_block: demais funcionalidades de mensagem cadastradas no
+#    Console (catálogo, botões, listas, carrosséis...) — ver funcionalidades.py
+# 5. data_atual_block + funcoes_block: agendamento e agenda do contato
+#    (consultar, remarcar, desmarcar) só com CALENDAR_EVENT — a data é a base
+#    pra converter "amanhã às 14h". Desligado, entra só o aviso de que o
+#    agente não tem acesso à agenda. O card do Kanban roda no runner, sem
+#    instrução.
+# 6. rag_block (só com ragEnabled) e rgbs_block: quebra da resposta em várias
+#    mensagens com [QB] (só com RGBS ligado — o consumer faz o split e envia
+#    uma por vez)
 # As ferramentas padrão (atendimento humano, encerrar, parar campanhas) não
 # têm texto no prompt: o modelo as conhece pelas docstrings em tools.py.
 IDENTIDADE_INSTRUCTION = "Você é {nome}."
@@ -56,6 +60,8 @@ como uma mensagem separada.
   mensagem só, sem marcador.
 - Nunca coloque [QB] no começo ou no fim da resposta, nem dois seguidos.
 - Nunca quebre no meio de uma frase, de uma lista ou de um link.
+- Resposta em que você envia uma funcionalidade de mensagem ou um formulário
+  sai numa mensagem só, no corpo da funcionalidade: não use [QB] nela.
 
 Exemplo: Oi, Maria! Tudo bem?[QB]Consigo te ajudar com isso, sim.[QB]Qual o melhor horário pra você?
 """
@@ -69,19 +75,34 @@ resposta.
 """
 
 # Coleta dos metadados criados no card "Metadados" do Agent Console (só os
-# ativos, via payload agent.metadataFields) — não existe dado fixo: sem
-# metadado cadastrado, esta seção não entra. Dirigida pelo bloco "Dados já
-# registrados" (_build_known_data_block), não por qual turno da conversa está.
+# ativos, via payload agent.metadataFields) e dos Flows com "salvar como
+# metadados" — não existe dado fixo: sem nenhum dos dois, esta seção não
+# entra. Dirigida pelo bloco "Dados já registrados" (_build_known_data_block),
+# não por qual turno da conversa está.
 COLETA_DADOS_INSTRUCTION = """
 ## Coleta de dados obrigatória
 
-Colete estes dados do contato, um de cada vez, seguindo a regra de cada um
+{partes}
+"""
+
+COLETA_METADADOS = """Colete estes dados do contato, um de cada vez, seguindo a regra de cada um
 (pule qualquer um que já esteja em "Dados já registrados" acima). Assim que o
 contato informar um deles, chame registrar_metadado com a chave exata
 indicada:
 
-{itens}
-"""
+{itens}"""
+
+# O Inbound-Service grava as respostas em Target.metadata e manda pro agente
+# a mensagem "📝 Respondeu o formulário ..." (interactive-reply-service.ts).
+COLETA_FLOWS = """Estes formulários (Flows) {tambem}fazem parte da coleta: envie cada um com
+enviar_flow, informando o id, no momento do "Quando usar" dele{sem_momento}, e
+espere o contato responder antes de seguir. Um formulário está respondido
+quando chega a mensagem "📝 Respondeu o formulário ..."; as respostas são
+salvas sozinhas nos metadados do contato, então não pergunte de novo o que
+ele preencheu, não chame registrar_metadado para elas e não reenvie um
+formulário já respondido:
+
+{itens}"""
 
 ENCERRAMENTO_INSTRUCTION = """
 ## Encerramento
@@ -91,8 +112,8 @@ ENCERRAMENTO_INSTRUCTION = """
 
 # Condição de "terminou" de cada combinação coleta x agendamento — entra no
 # {condicao} dos textos de encerramento abaixo.
-CONDICAO_COLETA = "todos os dados estiverem registrados"
-CONDICAO_COLETA_E_AGENDAMENTO = 'todos os dados estiverem registrados e o evento estiver agendado (ver "Funções" abaixo)'
+CONDICAO_COLETA = "a coleta de dados estiver concluída"
+CONDICAO_COLETA_E_AGENDAMENTO = 'a coleta de dados estiver concluída e o evento estiver agendado (ver "Funções" abaixo)'
 CONDICAO_AGENDAMENTO = 'o evento estiver agendado (ver "Funções" abaixo)'
 
 ENCERRAMENTO_SEM_AGENDAMENTO = """Quando {condicao}, agradeça, diga que a equipe vai
@@ -128,14 +149,38 @@ evento. consultar_eventos_calendario mostra os horários já ocupados, útil
 para sugerir alternativas.
 
 {momentos}
+
+### Agenda do contato
+
+O contato pode perguntar sobre os eventos dele: use consultar_eventos_calendario
+e informe o dia, o horário e com quem é cada evento (o "responsavel"). Fale
+só dos eventos dele, nunca dos horários de outras pessoas.
+
+- Remarcar: se ele quiser mudar a data de um evento, confirme qual é e a nova
+  data (sempre futura) e chame agendar_evento com o evento_id dele.
+- Desmarcar: se ele quiser cancelar, confirme qual evento é e chame
+  desmarcar_evento com o evento_id. Depois, pergunte se ele quer marcar outra
+  data.
+"""
+
+# Agendamento desligado no Console: sem as ferramentas de agenda, e o modelo
+# não pode repassar nem prometer nada de eventos (mesmo que o contato saiba
+# de um evento marcado pela equipe).
+SEM_AGENDA_INSTRUCTION = """
+## Agenda
+
+Você não tem acesso à agenda de eventos. Não informe nem confirme datas,
+horários ou responsáveis de eventos, e não marque, remarque ou desmarque
+nenhum. Se o contato pedir algo da agenda, diga que a equipe vai ajudar com
+isso.
 """
 
 EVENTO_NO_INICIO = """Quando: no início da conversa — logo depois de cumprimentar/se apresentar e
 ANTES da coleta de dados. Só siga para a coleta depois que o evento estiver
 agendado (ou se o contato disser que não quer agendar)."""
 
-EVENTO_APOS_COLETA = """Quando: depois que todos os dados da coleta estiverem registrados, antes de
-encerrar a conversa."""
+EVENTO_APOS_COLETA = """Quando: depois que a coleta de dados estiver concluída, antes de encerrar a
+conversa."""
 
 # Agendamento ligado sem nenhum metadado cadastrado: não há coleta para
 # esperar, então o momento "após a coleta" vira "logo no início".
@@ -186,7 +231,7 @@ def funcoes_ativas(agent_info: dict) -> dict[str, dict]:
 
 def _build_funcao_evento_block(evento: dict | None, tem_coleta: bool) -> str:
     if not evento:
-        return ""
+        return SEM_AGENDA_INSTRUCTION
     momentos = []
     if not tem_coleta:
         # EVENTO_NO_INICIO fala em "antes da coleta": sem coleta, os dois
@@ -213,11 +258,20 @@ def campos_metadados(agent_info: dict) -> list[dict]:
     return campos
 
 
-def _build_coleta_dados_block(campos: list[dict], encerramento: str | None, tem_envio: bool) -> str:
+def _build_coleta_dados_block(campos: list[dict], flows: list[dict], encerramento: str | None, tem_envio: bool) -> str:
     partes = []
-    if campos:
-        itens = "\n".join(f"- {c['chave']} ({c['nome']}): {c['regra']}" for c in campos)
-        partes.append(COLETA_DADOS_INSTRUCTION.format(itens=itens))
+    if campos or flows:
+        coleta = []
+        if campos:
+            itens = "\n".join(f"- {c['chave']} ({c['nome']}): {c['regra']}" for c in campos)
+            coleta.append(COLETA_METADADOS.format(itens=itens))
+        if flows:
+            coleta.append(COLETA_FLOWS.format(
+                tambem="também " if campos else "",
+                sem_momento=" (sem isso, depois dos dados acima)" if campos else "",
+                itens="\n".join(funcionalidades.descrever_flow_coleta(f) for f in flows),
+            ))
+        partes.append(COLETA_DADOS_INSTRUCTION.format(partes="\n\n".join(coleta)))
         if tem_envio:
             partes.append(funcionalidades.COLETA_SEM_FUNCIONALIDADE)
     if encerramento:
@@ -329,23 +383,25 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
     rag_enabled = bool(agent_info.get("ragEnabled"))
 
     campos = campos_metadados(agent_info)
-    tem_coleta = bool(campos)
+    flows_coleta = funcionalidades.flows_da_coleta(agent_info)
+    tem_coleta = bool(campos or flows_coleta)
 
     funcoes = funcoes_ativas(agent_info)
     evento = funcoes.get(FUNCAO_EVENTO)
     encerramento = _build_encerramento(tem_coleta, evento, bool(agent_info.get("handoffAfterFunctions")))
 
-    # Ordem importa: os dados conhecidos vêm antes da coleta, que se refere a
-    # eles como "acima". Blocos vazios (função desligada) ficam de fora.
+    # Ordem fixa (ver o comentário do topo): personalidade, dados conhecidos,
+    # coleta (que se refere aos dados como "acima"), funcionalidades,
+    # agendamento, RAG e RGBS. Blocos vazios (função desligada) ficam de fora.
     blocos = [
         IDENTIDADE_INSTRUCTION.format(nome=nome),
         personality,
         _build_known_data_block(target_info, campos, evento) if tem_coleta else "",
-        _build_coleta_dados_block(campos, encerramento, funcionalidades.tem_envio(agent_info)),
+        _build_coleta_dados_block(campos, flows_coleta, encerramento, funcionalidades.tem_envio(agent_info)),
+        funcionalidades.build_funcionalidades_block(agent_info, tem_coleta),
         _build_data_atual_block() if evento else "",
         _build_funcao_evento_block(evento, tem_coleta),
         RAG_INSTRUCTION if rag_enabled else "",
-        funcionalidades.build_funcionalidades_block(agent_info, tem_coleta),
         RGBS_INSTRUCTION if (agent_info.get("rgbs") or {}).get("enabled") else "",
     ]
     instruction = "\n\n".join(b.strip() for b in blocos if b and b.strip())
@@ -363,7 +419,7 @@ def build_agent(agent_info: dict, target_info: dict | None = None) -> Agent:
         tools.append(_build_metadado_tool(campos))
 
     if evento:
-        tools.extend([agendar_evento, consultar_eventos_calendario])
+        tools.extend([agendar_evento, consultar_eventos_calendario, desmarcar_evento])
 
     tools.extend(funcionalidades.build_tools(agent_info, target_info))
 

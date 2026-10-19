@@ -44,11 +44,29 @@ MAX_PRODUTOS_LISTA = 30
 MIN_CARDS, MAX_CARDS = 2, 10
 MAX_BOTOES_RESPOSTA = 3
 MAX_BOTAO_FLOW = 30
+MAX_TEXTO = 4096  # mensagem de texto comum (prévia de link)
 
-# Tipos em que o texto da mensagem é o corpo do próprio envio: com o texto da
-# ferramenta vazio, a resposta do agente vira esse corpo (em vez de sair
-# como mensagem separada antes).
-TIPOS_COM_CORPO = {CTA_URL, LIST, REPLY_BUTTONS, LOCATION_REQUEST, LINK_PREVIEW, PAYMENT, FLOW}
+# Tipos em que o texto da mensagem é o corpo do próprio envio (todos menos a
+# resposta em contexto, que só cita uma mensagem). Regra geral: a resposta do
+# agente vira esse corpo e sai só a mensagem da funcionalidade, nunca um
+# texto e depois o envio (ver montar_itens).
+TIPOS_COM_CORPO = {
+    CATALOG, PRODUCT_CAROUSEL, MEDIA_CAROUSEL, CTA_URL, LIST, REPLY_BUTTONS,
+    LOCATION_REQUEST, LINK_PREVIEW, PAYMENT, FLOW,
+}
+
+# Limite de caracteres do texto de cada tipo (a resposta inteira do agente
+# entra nele, ver montar_itens) — vai fixo no prompt de cada funcionalidade.
+# Acima disso o texto é cortado com "…".
+LIMITE_TEXTO = {tipo: MAX_BODY for tipo in TIPOS_COM_CORPO} | {LINK_PREVIEW: MAX_TEXTO}
+
+
+def _linha_limite(tipo: str) -> str:
+    limite = LIMITE_TEXTO.get(tipo)
+    if not limite:
+        return ""
+    return f"Limite do texto: até {limite} caracteres, contando a sua resposta inteira (passou disso, é cortado)."
+
 
 TEXTO_PADRAO = {
     CATALOG: "Confira nosso catálogo:",
@@ -129,7 +147,7 @@ def _erro(mensagem: str) -> dict:
 
 
 def _ok(envio: dict) -> dict:
-    return {"ok": True, "mensagem": "Envio registrado: sai logo após a sua resposta.", "envio": envio}
+    return {"ok": True, "mensagem": "Envio registrado: a sua resposta sai como texto desta mensagem.", "envio": envio}
 
 
 def _ids_disponiveis(agent_info: dict, tipo: str) -> str:
@@ -150,13 +168,13 @@ descrita em "Quando usar" (definida pela empresa) e informe sempre o id dela.
 
 # Só com alguma funcionalidade de envio (respostas contextuais não contam).
 REGRAS_ENVIO = """
-- Parâmetro texto: frase que acompanha o envio.{com_corpo}
+- Resposta com envio sai numa mensagem só: todo o texto da sua resposta vai
+  no corpo da mensagem da funcionalidade, nunca como mensagem separada antes
+  dela. Escreva essa resposta curta, como o texto da própria funcionalidade,
+  dentro do "Limite do texto" dela, e deixe o parâmetro texto vazio.
 - Não repita por escrito o que já vai no envio (produtos, opções, links).
 - No máximo um envio de cada funcionalidade por resposta.
 """
-
-REGRA_TEXTO_COM_CORPO = """ Em {tipos}, deixe vazio para
-  que a sua própria resposta seja o texto da mensagem (recomendado)."""
 
 # Só quando o agente também tem metadados para coletar (ver
 # agent._build_coleta_dados_block) — sem isso as duas instruções brigam.
@@ -166,6 +184,31 @@ REGRA_SEM_COLETA_NO_ENVIO = """- Resposta com envio de funcionalidade = resposta
   parâmetro texto da ferramenta. Essa resposta fala só do envio. Retome a
   coleta na próxima resposta que for só texto livre, sem funcionalidade.
 """
+
+
+def flows_da_coleta(agent_info: dict) -> list[dict]:
+    """Flows com "salvar como metadados" ligado: entram na "Coleta de dados
+    obrigatória" (ver agent._build_coleta_dados_block), não no bloco de
+    funcionalidades."""
+    return [f for f in listar(agent_info, FLOW) if _config(f).get("saveAsMetadata")]
+
+
+def _de_midia(agent_info: dict) -> list[dict]:
+    """Funcionalidades do bloco "Funcionalidades de mensagem": todas menos os
+    Flows da coleta."""
+    da_coleta = {f["id"] for f in flows_da_coleta(agent_info)}
+    return [f for f in listar(agent_info) if f["id"] not in da_coleta]
+
+
+def descrever_flow_coleta(flow: dict) -> str:
+    config = _config(flow)
+    linha = (
+        f'- {flow.get("name") or ROTULO[FLOW]} (id: {flow["id"]}): abre o formulário '
+        f'"{config.get("flowName")}" pelo botão "{config.get("ctaText")}".'
+    )
+    if (flow.get("prompt") or "").strip():
+        linha += f" Quando usar: {flow['prompt'].strip()}"
+    return f"{linha} {_linha_limite(FLOW)}"
 
 
 def tem_envio(agent_info: dict) -> bool:
@@ -178,8 +221,8 @@ def tem_envio(agent_info: dict) -> bool:
 # de envio — sem isso as duas instruções brigam (a coleta manda perguntar).
 COLETA_SEM_FUNCIONALIDADE = """
 Faça as perguntas desta coleta só em respostas de texto livre. Nunca pergunte
-nenhum destes dados na mesma resposta em que enviar uma funcionalidade de
-mensagem (ver "Funcionalidades de mensagem"): deixe para a próxima resposta.
+nenhum destes dados na mesma resposta em que enviar um formulário ou outra
+funcionalidade de mensagem: deixe para a próxima resposta.
 """
 
 
@@ -187,10 +230,7 @@ def _build_regras(funcionalidades: list[dict], tem_coleta: bool) -> str:
     tipos = list(dict.fromkeys(f.get("type") for f in funcionalidades))
     partes = [REGRAS_INTRO]
     if any(t != CONTEXTUAL_REPLY for t in tipos):
-        com_corpo = [ROTULO[t].lower() for t in tipos if t in TIPOS_COM_CORPO]
-        partes.append(REGRAS_ENVIO.format(
-            com_corpo=REGRA_TEXTO_COM_CORPO.format(tipos=", ".join(com_corpo)) if com_corpo else "",
-        ))
+        partes.append(REGRAS_ENVIO)
         if tem_coleta:
             partes.append(REGRA_SEM_COLETA_NO_ENVIO)
     return "".join(partes)
@@ -256,12 +296,8 @@ def _detalhes(funcionalidade: dict) -> list[str]:
             "com o número dela: sua resposta sai citando essa mensagem."
         )
     elif tipo == FLOW:
+        # Os de "salvar como metadados" ficam na coleta (descrever_flow_coleta).
         linhas.append(f'Abre o formulário "{config.get("flowName")}" pelo botão "{config.get("ctaText")}".')
-        if config.get("saveAsMetadata"):
-            linhas.append(
-                "As respostas do formulário são salvas automaticamente nos metadados do contato: "
-                "não pergunte de novo o que ele já preencheu."
-            )
         linhas.append("Quando o contato enviar, as respostas chegam como mensagem dele.")
     elif tipo == PAYMENT:
         metodos = ", ".join(config.get("methods") or [])
@@ -271,15 +307,17 @@ def _detalhes(funcionalidade: dict) -> list[str]:
 
 def build_funcionalidades_block(agent_info: dict, tem_coleta: bool) -> str:
     """Só as funcionalidades cadastradas no agente (agent.features — FLOW já
-    chega filtrado pelo WABA/status no Inbound-Service). Sem nenhuma, o bloco
-    não entra no prompt."""
-    funcionalidades = listar(agent_info)
+    chega filtrado pelo WABA/status no Inbound-Service), sem os Flows da
+    coleta. Sem nenhuma, o bloco não entra no prompt."""
+    funcionalidades = _de_midia(agent_info)
     if not funcionalidades:
         return ""
     partes = [_build_regras(funcionalidades, tem_coleta)]
     for f in funcionalidades:
         partes.append(f"### {f.get('name') or ROTULO.get(f['type'], f['type'])} (id: {f['id']})")
         partes.append(f"Tipo: {ROTULO.get(f['type'], f['type'])} | ferramenta: {FERRAMENTA.get(f['type'])}")
+        if _linha_limite(f["type"]):
+            partes.append(_linha_limite(f["type"]))
         if (f.get("prompt") or "").strip():
             partes.append(f"Quando usar: {f['prompt'].strip()}")
         partes += _detalhes(f)
@@ -305,7 +343,7 @@ def build_tools(agent_info: dict, target_info: dict | None = None) -> list:
                 tipo: "catalogo_completo" (catálogo inteiro) ou "produtos" (só os SKUs).
                 skus: SKUs da lista do catálogo (1 a 30 no tipo "produtos"; no
                     completo, opcional: o primeiro vira a foto de capa).
-                texto: frase curta que acompanha o envio.
+                texto: texto da mensagem; vazio = usa a sua resposta.
             """
             f = _por_id(agent_info, funcionalidade_id, CATALOG)
             if not f:
@@ -328,7 +366,7 @@ def build_tools(agent_info: dict, target_info: dict | None = None) -> list:
             Args:
                 funcionalidade_id: id da funcionalidade de carrossel de produtos.
                 skus: 2 a 10 SKUs da lista (ignorado quando os produtos são fixos ou vêm do sistema da empresa).
-                texto: frase curta que acompanha o carrossel.
+                texto: texto da mensagem; vazio = usa a sua resposta.
             """
             f = _por_id(agent_info, funcionalidade_id, PRODUCT_CAROUSEL)
             if not f:
@@ -418,7 +456,7 @@ def build_tools(agent_info: dict, target_info: dict | None = None) -> list:
 
             Args:
                 funcionalidade_id: id da funcionalidade de carrossel de mídia.
-                texto: frase que acompanha o carrossel.
+                texto: texto da mensagem; vazio = usa a sua resposta.
             """
             f = _por_id(agent_info, funcionalidade_id, MEDIA_CAROUSEL)
             if not f:
@@ -770,6 +808,17 @@ def _formatar_reais(centavos: int) -> str:
     return f"R$ {centavos / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _juntar_corpo(partes: list[str], texto: str) -> str:
+    """Resposta + parâmetro texto da ferramenta, sem repetir quando um já
+    contém o outro."""
+    resposta = "\n\n".join(partes)
+    if not texto or texto in resposta:
+        return resposta
+    if resposta in texto:
+        return texto
+    return f"{resposta}\n\n{texto}"
+
+
 def montar_itens(agent_info: dict, partes_texto: list[str], envios: list[dict], ids_mensagens: list[str]) -> list[dict]:
     """Junta o texto da resposta (já quebrado pelo RGBS, se ligado) com os
     envios das ferramentas, na ordem em que saem. Item = {"text"} ou
@@ -792,10 +841,12 @@ def montar_itens(agent_info: dict, partes_texto: list[str], envios: list[dict], 
         if not f:
             continue
         texto = envio.get("texto") or ""
-        # Corpo vazio nos tipos com corpo: a última parte da resposta vira o
-        # corpo da mensagem (sai uma mensagem só, em vez de texto + envio).
-        if not texto and tipo in TIPOS_COM_CORPO and partes:
-            texto = partes.pop()
+        # Regra geral: a resposta inteira (todas as partes do RGBS) vira o
+        # corpo do primeiro envio. Sai só a mensagem da funcionalidade, nunca
+        # um texto e depois o envio.
+        if tipo in TIPOS_COM_CORPO and partes:
+            texto = _juntar_corpo(partes, texto)
+            partes = []
 
         if tipo == CATALOG:
             interactive, resumo = _interactive_catalogo(f, envio, texto)
@@ -815,7 +866,7 @@ def montar_itens(agent_info: dict, partes_texto: list[str], envios: list[dict], 
             interactive, resumo = _interactive_flow(f, texto)
         elif tipo == LINK_PREVIEW:
             url = _config(f)["url"]
-            corpo = f"{texto}\n\n{url}" if texto else url
+            corpo = f"{_cortar(texto, MAX_TEXTO - len(url) - 2)}\n\n{url}" if texto else url
             itens_envio.append({"text": corpo, "previewUrl": True})
             continue
         elif tipo == PAYMENT:
